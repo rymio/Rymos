@@ -1,0 +1,15 @@
+# RYMOS tiny language demo
+print RYSH tiny language running inside RYMOS
+pid
+args
+set greeting hello-from-script
+print $greeting
+env
+getenv RYMOS_TARGET
+getenv PATH
+time
+stdio
+wait 1
+cat build/packages.txt
+cat build/selfhost.txt
+stat build/selfhost.txt

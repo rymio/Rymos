@@ -1,0 +1,5 @@
+# Check a host-uploaded multi-megabyte-capable RYMFS file
+stat pfs:uploads
+listdir pfs:uploads
+stat pfs:uploads/blob16.bin
+countfile pfs:uploads/blob16.bin

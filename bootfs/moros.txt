@@ -1,0 +1,5 @@
+MOROS is vendored as an MIT-licensed reference.
+
+RYMOS has adopted command naming, pseudo-device ideas, and a PCI scanner path.
+Large MOROS subsystems need allocator, interrupts, paging, and block devices
+before they can be ported cleanly.

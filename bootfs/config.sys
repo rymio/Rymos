@@ -1,0 +1,8 @@
+rem RYMOS driver configuration
+driver serial on
+driver ps2-keyboard polling
+driver vga-text mirror
+driver gop-framebuffer 1024x768
+driver pci scan
+filesystem bootfs readonly
+filesystem ramfs volatile

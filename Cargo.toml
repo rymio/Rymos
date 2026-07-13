@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "bootloader",
+  "kernel",
+  "runtime/rymos-user",
+  "programs/allocdemo",
+  "programs/hello",
+  "programs/rysh",
+]
+resolver = "3"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+strip = false
+lto = true
+codegen-units = 1

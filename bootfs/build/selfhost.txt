@@ -1,0 +1,30 @@
+# RYMOS self-hosting status
+
+name: RYMOS Rust self-hosting
+milestone: 8
+goal: Run a Rust toolchain on RYMOS after the OS grows enough POSIX-like runtime support.
+
+summary: blocked=1, partial=8, planned=2
+
+[partial] Program ABI
+  ELF programs run synchronously in trusted kernel mode with ABI v10, descriptor IO, stdio fds, stat, listing, mkdir, unlink, rename, environment reads, process status, heap page allocation, and monotonic ticks.
+[partial] Core Runtime
+  rymos-user exposes console, args, pid, line input, and read-only BootFS reads.
+[partial] Persistent Filesystem
+  RYMFS3 persists 256 MiB files in contiguous dynamic extents with 96 entries and compact nested directories with unlink/rename, but rustc still needs richer directory behavior and non-contiguous allocation.
+[partial] Process Model
+  PIDs, exit status, and ABI wait/status exist; spawn is blocked until app loading can isolate or relocate child programs.
+[partial] Memory Management
+  UEFI memory map, physical page allocation, kernel-owned PML4, virtual mappings, per-process heap windows, and heap unmap/reclaim exist; rustc still needs mmap-like behavior, page-table reclaim, and larger address spaces.
+[partial] File Descriptor ABI
+  BootFS read handles, RYMFS3 read/write/seek handles, stat, listing, compact nested mkdir, unlink, rename, 96 entries, and 256 MiB files exist.
+[partial] Toolchain Target
+  x86_64-rymos.json exists; custom target builds need nightly/rust-src today.
+[planned] libcore
+  Build core and compiler_builtins for x86_64-rymos.
+[partial] liballoc
+  rymos-user grows a bump heap through kernel-mapped pages and can run Vec/String smoke tests in per-process virtual windows; heap data pages are unmapped and reclaimed on process exit.
+[planned] libstd
+  Requires more RYMOS implementations for safe process spawning, calibrated time, networking stubs, and synchronization; read-only env and raw tick support have started.
+[blocked] Rust Compiler
+  Port only after libstd, large persistent filesystem, process spawning, and enough memory are available.

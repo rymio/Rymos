@@ -1,0 +1,11 @@
+[package]
+name = "rymos-program-allocdemo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rymos-user = { path = "../../runtime/rymos-user" }
+
+[[bin]]
+name = "allocdemo"
+path = "src/main.rs"

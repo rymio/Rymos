@@ -1,0 +1,17 @@
+Current drivers:
+
+- serial 16550
+- PS/2 keyboard polling
+- VGA text buffer
+- UEFI GOP framebuffer
+- PCI config-space scanner
+- RAMFS
+- read-only bootfs initrd
+
+Planned:
+
+- xHCI USB host controller
+- USB HID keyboard
+- VirtIO or ATA block device
+- FAT32 in-kernel mount
+- NIC driver and network stack

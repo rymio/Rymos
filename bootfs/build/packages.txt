@@ -1,0 +1,5 @@
+# RYMOS installed packages
+
+hello rymos-program-hello hello bootfs/programs/hello.elf
+rysh rymos-program-rysh rysh bootfs/programs/rysh.elf
+allocdemo rymos-program-allocdemo allocdemo bootfs/programs/allocdemo.elf

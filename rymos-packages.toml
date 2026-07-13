@@ -1,0 +1,28 @@
+[package_set]
+name = "base"
+version = "0.1.0"
+description = "Base RYMOS boot programs"
+
+[[program]]
+name = "hello"
+package = "rymos-program-hello"
+bin = "hello"
+source = "programs/hello"
+install = "programs/hello.elf"
+enabled = true
+
+[[program]]
+name = "rysh"
+package = "rymos-program-rysh"
+bin = "rysh"
+source = "programs/rysh"
+install = "programs/rysh.elf"
+enabled = true
+
+[[program]]
+name = "allocdemo"
+package = "rymos-program-allocdemo"
+bin = "allocdemo"
+source = "programs/allocdemo"
+install = "programs/allocdemo.elf"
+enabled = true

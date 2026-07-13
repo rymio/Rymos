@@ -1,0 +1,39 @@
+# RYMOS persistent descriptor demo
+writefile pfs:fd-demo.txt hello-from-pfs-fd
+cat pfs:fd-demo.txt
+stat pfs:fd-demo.txt
+mkdir pfs:src
+mkdir pfs:src/bin
+writefile pfs:src/main.rs fn-main
+writefile pfs:src/bin/app.rs nested-main
+fillfile pfs:src/big.bin 6000
+stat pfs:src
+stat pfs:src/main.rs
+stat pfs:src/bin
+stat pfs:src/bin/app.rs
+rename pfs:src/bin/app.rs pfs:src/bin/renamed.rs
+stat pfs:src/bin/renamed.rs
+cat pfs:src/bin/renamed.rs
+rm pfs:src/bin/renamed.rs
+stat pfs:src/big.bin
+listdir pfs:
+listdir pfs:src
+listdir pfs:src/bin
+countfile pfs:src/big.bin
+writefile pfs:file00 00
+writefile pfs:file01 01
+writefile pfs:file02 02
+writefile pfs:file03 03
+writefile pfs:file04 04
+writefile pfs:file05 05
+writefile pfs:file06 06
+writefile pfs:file07 07
+writefile pfs:file08 08
+writefile pfs:file09 09
+writefile pfs:file10 10
+writefile pfs:file11 11
+writefile pfs:file12 12
+writefile pfs:file13 13
+writefile pfs:file14 14
+writefile pfs:file15 15
+stat pfs:file15

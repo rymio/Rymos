@@ -1,0 +1,11 @@
+[package]
+name = "rymos-program-rysh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rymos-user = { path = "../../runtime/rymos-user" }
+
+[[bin]]
+name = "rysh"
+path = "src/main.rs"

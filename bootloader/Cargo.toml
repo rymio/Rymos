@@ -1,0 +1,8 @@
+[package]
+name = "rymos-bootloader"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rymos-bootloader"
+path = "src/main.rs"
