@@ -108,8 +108,75 @@ For the exact commands to set up a machine and rebuild everything by hand
     Raised to 32 MiB.
   Verified live in QEMU: a real `#![feature(restricted_std)]` binary using
   `println!`, `Vec`, and iterators printed correct output and exited cleanly
-  with heap reclaimed. Still stubbed: `sys::fs`, `sys::env`, `sys::process`,
-  `sys::time`, real randomness, real errno mapping.
+  with heap reclaimed. Still stubbed at the time: `sys::fs`, `sys::env`,
+  `sys::process`, `sys::time`, real randomness, real errno mapping -- see the
+  next entry for all of those.
+
+- **Real `std::fs`/`std::env`/`std::time`/`std::random` wired onto the ABI**
+  (category 5): `sys::pal::rymos::abi`'s `RymosAbi` struct previously only
+  had real field *types* through `mem_alloc_pages` (the last field the pal
+  actually called; everything after was an untyped placeholder, by explicit
+  design at the time). Extended it with every remaining field's exact C ABI
+  signature, re-derived from `runtime/rymos-user/src/lib.rs`'s copy (the two
+  have to match by hand, same as the kernel's own copy already does),
+  including packed conventions like `env_list`'s `(key_len << 32) |
+  value_len` -- cross-checked against `kernel/src/main.rs`'s `abi_env_list`
+  directly, not assumed. Then implemented, for real, against it:
+  - `sys::env`: `getenv`/`setenv`/`unsetenv`/`env()`, no local cache (unlike
+    e.g. Hermit's `HashMap`-backed one) since the kernel is already the
+    single source of truth for a process's environment.
+  - `sys::args`: `args()` via `argv_count`/`argv_get`, queried live every
+    call rather than cached at start (there's no ready-made argv array to
+    hand off in the first place, and argv never changes after start anyway).
+  - `sys::paths`: `getcwd`/`chdir`/`temp_dir` (the last reading the `TMPDIR`
+    env var the kernel already seeds by default).
+  - `sys::fs`: a real `File` plus `stat`/`readdir`/`mkdir`/`unlink`/
+    `rename`-backed directory ops. No symlinks/hard links/file locking/
+    settable permissions on RYMOS, so those honestly stay `unsupported()`.
+    `remove_dir_all`/`Dir` are reused from `sys::fs::common` for free;
+    `copy` is hand-written rather than reusing `common::copy`, since that
+    needs fd-based `fstat` (RYMOS's `stat` is path-based only).
+  - `sys::io::error`: real `ERR_*`-to-`ErrorKind` mapping via `last_error`,
+    replacing the old `generic` fallback that reported every error as
+    "operation successful" regardless of what actually happened.
+  - `sys::random`: `RDRAND` when `CPUID` reports support, falling back to a
+    `SplitMix64` stream seeded from `time_ticks` plus stack/heap addresses
+    otherwise -- disclosed as not cryptographically secure, but real,
+    changing output instead of the previous panic.
+  - `sys::time`: `Instant` is real for ordering/equality (`time_ticks`, a
+    raw `rdtsc` read), but duration arithmetic honestly returns `None`
+    rather than fabricating a tick-to-nanosecond conversion factor with no
+    calibration reference anywhere in the kernel to base it on (no PIT/
+    timer, no CPUID TSC-frequency detection) -- category 4 already lists
+    tick calibration as separate, not-yet-done work, and a silently-wrong
+    number seemed worse than an honest gap here, the same call already made
+    for `sys::random`'s old panic over fake output.
+  - `sys::process`: `Command`/spawning deliberately stays unsupported -- a
+    real architectural mismatch (RYMOS resolves programs by name through
+    `bootfs`, not a resolved filesystem path; `Stdio`/pipe wiring would need
+    `sys::pipe` support this port has never touched), not a bounded
+    ABI-wiring task like the others. `std::process::id()` is real, though.
+
+  Verified live in QEMU with a new `stdreal` program -- a genuine
+  `#![feature(restricted_std)]` binary (unlike every other test program,
+  not routed through `rymos-user`) exercising `std::process::id()`, real
+  argv, env get/set/iterate/remove, `current_dir`/`temp_dir`,
+  `fs::write`/`read_to_string`/`exists`/`read_dir`, `Instant` ordering, and a
+  `HashMap` (exercising the random support internally) -- all correct,
+  alongside the full existing `no_std` regression suite.
+
+  Two real bugs found and fixed along the way:
+  - A genuine crash on the first run: `std::process::id()` aborted via
+    `ud2` instead of returning a pid. Disassembly showed the call site was
+    `sys::process::unsupported::getpid` (which panics), not the real one
+    just added -- a stale `-Z build-std` target cache had kept using the
+    pre-edit sysroot build despite the source changing. This is the exact
+    gotcha `docs/dev-environment.md` already documents (`rm -rf
+    target/x86_64-rymos` before re-testing) hit live, not a new bug class.
+  - (See above) the packed `env_list` return convention had to be verified
+    against the kernel source directly rather than assumed from the field
+    name alone.
+
 - Spawned children now run in their own **isolated address space** instead of
   overwriting the parent's fixed-address program image. `create_process_address_space`
   gives each process a private PML4: a shallow top-level clone of the kernel's
@@ -171,6 +238,45 @@ For the exact commands to set up a machine and rebuild everything by hand
   process still uses the exact same virtual address for its image, just
   backed by different physical pages via separate page tables, which is
   isolation-via-separate-tables, not relocation.
+
+- **Heap/mmap page-table reclaim, and first CPU exception handling**
+  (category 3, memory): `process_reclaim_mappings` only freed a process's
+  tracked *data* pages on exit, never the PT/PD page-table pages that
+  pointed to them, which leaked permanently. `reclaim_process_window_tables`
+  fixes this without needing a private-PML4-style walk: since PIDs are never
+  reused and each PID's heap (256 MiB)/mmap (1 GiB) window sits at a fixed,
+  alignment-guaranteed address purely as a function of its own PID, a heap
+  window always owns a clean run of 128 PT-pointing PD entries (never a
+  whole PD -- 4 PIDs share the rest of it) and a mmap window always owns one
+  whole, exclusively-owned PD (freeable in full, not just its PTs). Verified
+  live in QEMU: three consecutive spawn/exit cycles of the same program
+  leave the allocator's used-page count exactly flat instead of growing.
+
+  This kernel had no IDT at all before this, so any fault triple-faulted the
+  whole machine with zero diagnostics. Added one covering all 32 CPU
+  exception vectors, via hand-written naked-function stubs rather than the
+  nightly-only `x86-interrupt` ABI (this kernel builds on stable): every
+  stub normalizes the stack (a filler error code for vectors that don't get
+  a real one) and jumps to one shared handler that prints vector, mnemonic,
+  error code, `CR2` (page faults), faulting RIP, and the current PID/process
+  name over serial, then halts. No new GDT needed -- it reads whichever code
+  segment UEFI's firmware already set up. Verified live in QEMU via a new
+  `faultcheck` program (deliberately outside the automated regression, since
+  passing halts the machine) across both guard-page directions, a raw
+  hardware divide-by-zero (Rust's own `/` panics before ever reaching
+  hardware, so this needs inline asm to bypass that and exercise the real
+  `#DE` path), and `ud2`. Found and disclosed, not fixed: a null-pointer
+  write doesn't fault today, because address 0 is already mapped as part of
+  the low-memory identity mapping rather than being guarded. Deliberately
+  not attempted: recovering from a fault instead of halting everything
+  (needs a prepared non-local-exit point to unwind an arbitrary nested Rust
+  call stack); a dedicated IST/TSS stack for the double-fault handler (so a
+  double fault from genuine stack exhaustion could still rarely triple-fault
+  if the handler itself has no stack room). Assessed, not changed: per-
+  process address spaces don't need to be larger yet -- the 256 MiB
+  heap/768 MiB mmap windows already exceed what fits in a 256 MiB QEMU test
+  VM once the 142 MiB image-window reservation is subtracted, so physical
+  RAM and that reservation are the real ceiling today, not the windows.
 
 - **Real process reaping**, and a genuine attempt (then revert) at real
   concurrent execution: `process_find_slot` used to let a brand-new `spawn`
@@ -297,24 +403,36 @@ For the exact commands to set up a machine and rebuild everything by hand
      spawn)
 
 3. Runtime surface:
-   - broaden argv support beyond the current 8 args / 64 bytes per arg
-   - grow `Command` toward more complete stdin/stdout/stderr parity
-   - calibrated time/clock calls
-   - randomness stub or driver
+   - broaden argv support beyond the current 8 args / 64 bytes per arg (this
+     is `rymos-user`'s own no_std `PROCESS_ARGV_*` ceiling; unrelated to
+     `std::env::args()`, which reads argv straight from the ABI with no
+     fixed-count limit of its own -- see Current Foundation)
+   - grow `Command` toward more complete stdin/stdout/stderr parity (the
+     `rymos-user::Command` builder used by `no_std` programs; `std`'s own
+     `std::process::Command` stays unsupported for a different, architectural
+     reason -- see Current Foundation)
+   - calibrated time/clock calls (also blocks `std::time::Instant`'s duration
+     arithmetic -- see Current Foundation and category 4)
+   - randomness stub or driver -- done at the `std` level: `sys::random`
+     does `RDRAND`-or-TSC-seeded-fallback; see Current Foundation
    - richer path normalization beyond the compact RYMFS path limit
-   - broader errno coverage across all ABI calls
-   - wire `sys::fs`/`sys::env`/`sys::process`/`sys::time` onto the real ABI
-     (today only stdio and the allocator are real; a `std` binary can print
-     and allocate but not yet open a file, read an env var, or spawn a
-     child -- see Current Foundation)
+   - broader errno coverage across all ABI calls (the kernel's own `ERR_*`
+     set is still small; `std`-level mapping of what exists today onto
+     `io::ErrorKind` is done -- see Current Foundation)
+   - wire `sys::fs`/`sys::env`/`sys::process`/`sys::time` onto the real ABI --
+     done for `fs`/`env`/`time` (ordering only); `std::process::Command`
+     deliberately still unsupported, a real design mismatch rather than a
+     bounded wiring gap -- see Current Foundation
 
 4. Memory:
-   - page-table page reclaim for the shared heap/mmap windows -- partially
-     done: the new per-process private image-window PT/PD/PDPT pages are
-     correctly reclaimed on exit (`destroy_process_address_space`), but the
-     older, more general gap remains for heap/mmap's own PT pages (which
-     live in the shared kernel PML4, not the new private tables)
-   - guard pages and allocation failure behavior
+   - page-table page reclaim for the shared heap/mmap windows -- done:
+     `reclaim_process_window_tables` frees the PT (heap) or PD+PT (mmap)
+     pages an exiting PID's window exclusively owned; see Current Foundation
+   - guard pages and allocation failure behavior -- done: an IDT with
+     handlers for all 32 CPU exception vectors turns a fault into a
+     diagnostic and a halt instead of a silent reset; see Current Foundation
+     for what's still open (fault recovery, IST/TSS for double faults, and
+     the address-0 identity-mapping gap found along the way)
    - isolated address spaces for the program-image window -- done: see
      Current Foundation
    - relocatable/PIE program loading (still unimplemented; unrelated to the
@@ -330,18 +448,44 @@ For the exact commands to set up a machine and rebuild everything by hand
    Superseded: real `std` now compiles and links via the `toolchain/rust`
    fork (see Current Foundation); `stdish` remains useful groundwork for the
    ABI-wiring work below.
-4. Cross-compile small CLI tools that use `std::fs` and `std::env`. `std`
-   binaries run today (stdio/alloc are real); blocked on wiring `sys::fs` and
-   `sys::env` onto the ABI, described above.
-5. Run cargo-like helper programs that spawn children.
+4. Cross-compile small CLI tools that use `std::fs` and `std::env`. Done for
+   a hand-written manual test (`stdreal`, see Current Foundation): real
+   `fs`/`env`/`args`/`cwd`/`time`-ordering/`random` all work. Still ahead:
+   this was one manually-built-and-tested binary, not a repeatable pipeline
+   -- `scripts/rymos-sdk.py`/`make programs` only build `no_std` programs
+   against the stable-compatible fallback target today, not real `std` via
+   the forked toolchain's `-Z build-std` path.
+5. Run cargo-like helper programs that spawn children. Blocked on
+   `std::process::Command`, which is a real design mismatch (RYMOS resolves
+   programs by name through `bootfs`, not a resolved filesystem path) rather
+   than a bounded wiring gap -- see Current Foundation.
 6. Port `cargo` after process, pipes, directories, and env are reliable.
 7. Port `rustc` last, after large files, memory, and child process behavior are
    boringly dependable.
 
 ## Near-Term Test Programs
 
-- `fswalk`: expand toward recursive trees, sparse writes, and fragmentation.
-- `spawncheck`: launch a child program and verify exit status.
-- `pipecheck`: parent writes to child stdin and reads child stdout.
-- `heapstress`: grow toward larger mmap/heap pressure and failure-path checks.
-- `stdshim`: grow toward a real `std` compatibility layer.
+- `fswalk`: covers nested directories, sparse writes, non-contiguous
+  extents/fragmentation, long paths, and many concurrent file descriptors.
+- Exit-status and stdin/stdout piping checks (originally sketched as
+  separate `spawncheck`/`pipecheck` programs) ended up folded into existing
+  ones instead: `cmdapi` verifies spawn/wait exit status end to end (plus
+  parent-globals-survive-spawn and process-reaping regressions), and
+  `echoin`/rysh's `spawnio`/`spawnioe` cover piped child stdin and
+  stdout/stderr capture.
+- `heapstress`: covers mmap/heap pressure and guarded-region access; still
+  room to grow toward more allocation-failure-path checks.
+- `stdshim`: `no_std` programs' std-shaped compatibility shim
+  (`rymos-user::stdish`) -- still useful groundwork/parity checking even now
+  that `stdreal` covers genuine `std` directly; the two test different
+  layers, not the same thing twice.
+- `stdreal`: a genuine `#![feature(restricted_std)]` binary (not routed
+  through `rymos-user`) exercising real `std::fs`/`std::env`/`std::process`/
+  `std::time`/`std::random`. Built manually via the forked-toolchain
+  `-Z build-std` path (see `docs/dev-environment.md`), not through
+  `scripts/rymos-sdk.py`, and deliberately left out of
+  `rymos-packages.toml`/`autoexec.bat` for the same reason -- there's no
+  build pipeline for real `std` programs yet, just this one hand-built test.
+- `faultcheck`: manual CPU exception diagnostic (guard-page touches, raw
+  divide-by-zero, invalid opcode) -- deliberately not part of the automated
+  regression, since a passing run halts the machine on purpose.

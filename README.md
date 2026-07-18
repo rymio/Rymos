@@ -141,6 +141,8 @@ programs/fswalk/       RYMFS5 filesystem smoke test (mkdir, write, append,
                        rename, stat, list)
 programs/heapstress/   mmap/heap pressure and guarded-region smoke test
 programs/stdshim/      std-shaped runtime shim smoke test
+programs/faultcheck/   Manual CPU exception diagnostic (deliberately
+                       crashes -- not part of the automated regression)
 ```
 
 The data disk image is sparse by default and grows logically to 4 GiB.
@@ -264,7 +266,13 @@ The runtime gives each process its own 256 MiB windowed bump heap, and
 `programs/allocdemo` verifies `alloc::vec::Vec` and `alloc::string::String`
 inside RYMOS. A forked `rustc` toolchain also lives at `toolchain/rust` (git
 submodule) with real `std` support for `x86_64-rymos` -- a genuine
-`std`-linked binary (`println!`, `Vec`, iterators) boots and runs today. See
+`std`-linked binary boots and runs today, with real `std::fs`, `std::env`
+(including argv, cwd, `temp_dir`), `std::time::Instant` (ordering), and
+`std::random`-backed `HashMap` support, verified via `programs/stdreal` (a
+manually-built test, not part of the normal SDK flow -- see
+`docs/dev-environment.md`). `std::process::Command` (spawning) is still
+unsupported by design: RYMOS resolves programs by name through `bootfs`, not
+a resolved filesystem path the way Unix's fork/exec model assumes. See
 `docs/self-hosting.md` for exactly what's real vs. still stubbed, and
 `docs/dev-environment.md` for the full build-from-scratch steps.
 
@@ -308,7 +316,11 @@ Current:
 - UEFI memory-map reader and physical page allocator.
 - Paging diagnostics, kernel-owned PML4 clone, zeroed page-table page
   allocation, scratch virtual mapping, and per-process private PML4/PDPT/PD
-  structures isolating each spawned child's program image.
+  structures isolating each spawned child's program image. Heap/mmap
+  page-table pages are reclaimed on process exit, not just the data pages.
+- An IDT covering all 32 CPU exception vectors: a fault (guard-page touch,
+  bad pointer, divide-by-zero, invalid opcode) prints a serial diagnostic
+  and halts instead of silently resetting the machine.
 - Volatile RAMFS.
 - Read-only bootfs initrd.
 - Persistent RYMFS over ATA PIO in QEMU.
@@ -394,6 +406,10 @@ programs/cmdapi/             Command API and parent-globals-survive-spawn test
 programs/fswalk/             RYMFS5 filesystem smoke test
 programs/heapstress/         mmap/heap pressure smoke test
 programs/stdshim/            std-shaped runtime shim smoke test
+programs/faultcheck/         Manual CPU exception diagnostic (crashes on purpose)
+programs/stdreal/            Genuine std::fs/env/process/time/random smoke
+                             test -- built manually via the forked toolchain,
+                             not through scripts/rymos-sdk.py
 programs/rysh/               Tiny RYMOS script interpreter
 targets/x86_64-rymos.json    Canonical custom target spec for programs
 toolchain/rust/              Forked rust-lang/rust (submodule) with real

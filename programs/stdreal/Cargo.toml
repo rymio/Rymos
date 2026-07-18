@@ -1,0 +1,9 @@
+[package]
+name = "rymos-program-stdreal"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "stdreal"
+path = "src/main.rs"

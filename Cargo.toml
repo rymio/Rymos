@@ -6,10 +6,12 @@ members = [
   "programs/allocdemo",
   "programs/cmdapi",
   "programs/echoin",
+  "programs/faultcheck",
   "programs/fswalk",
   "programs/heapstress",
   "programs/hello",
   "programs/rysh",
+  "programs/stdreal",
   "programs/stdshim",
 ]
 exclude = ["toolchain/rust"]

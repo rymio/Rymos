@@ -614,6 +614,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         serial_init();
         init_physical_allocator(boot_info);
     }
+    init_idt();
 
     console.clear();
     console.write_line("RYMOS minimal Rust kernel");
@@ -1939,6 +1940,75 @@ fn process_reclaim_mappings(index: usize) -> usize {
         process.heap_pages.fill(0);
         process.heap_page_count = 0;
         reclaimed
+    }
+}
+
+/// Frees the page-table *structure* pages backing `pid`'s heap and mmap
+/// windows (the PT/PD pages `ensure_next_table` allocated while mapping
+/// data into them) -- `process_reclaim_mappings` only frees the tracked data
+/// pages, not the tables that pointed to them, so those structural pages
+/// used to leak forever once a process exited (see `docs/self-hosting.md`).
+///
+/// Safe without a private-PML4-style walk (unlike
+/// `destroy_process_address_space`) because PIDs are never reused and each
+/// PID's window sits at a fixed, alignment-guaranteed address purely as a
+/// function of its own PID:
+/// - a heap window (`USER_HEAP_STRIDE` = 256 MiB) is exactly a quarter of one
+///   shared PD's 1 GiB span, so it owns a clean, non-overlapping run of 128
+///   PD entries (each pointing to one exclusively-owned PT) -- never a whole
+///   PD, since 4 different PIDs' windows share that PD's other entries.
+/// - a mmap window (`USER_MMAP_STRIDE` = 1 GiB) is exactly one whole PD span,
+///   so the entire PD (and every PT it owns) belongs to this PID alone, and
+///   the PD itself can be freed too.
+/// Both stride values and both base addresses were checked to divide evenly
+/// (`USER_HEAP_BASE`/`USER_MMAP_BASE` are 1 GiB-aligned), so this never frees
+/// a table page another still-alive process's window also depends on.
+fn reclaim_process_window_tables(pid: u32) {
+    let Some(kernel_pml4) = (unsafe {
+        let phys = KERNEL_PML4_PHYS;
+        if phys == 0 { None } else { Some(phys) }
+    }) else {
+        return;
+    };
+
+    let heap_base = USER_HEAP_BASE + pid as u64 * USER_HEAP_STRIDE;
+    if let Some(pdpt_phys) =
+        table_entry_address(kernel_pml4 as *mut u64, pml4_index(heap_base))
+    {
+        if let Some(pd_phys) = table_entry_address(pdpt_phys as *mut u64, pdpt_index(heap_base)) {
+            let start_pd = pd_index(heap_base);
+            let end_pd = start_pd + (USER_HEAP_STRIDE / (2 * 1024 * 1024)) as usize;
+            let pd = pd_phys as *mut u64;
+            for pd_idx in start_pd..end_pd {
+                if let Some(pt_phys) = table_entry_address(pd, pd_idx) {
+                    free_phys_page(pt_phys);
+                    unsafe {
+                        pd.add(pd_idx).write_volatile(0);
+                        invlpg(heap_base + (pd_idx - start_pd) as u64 * 2 * 1024 * 1024);
+                    }
+                }
+            }
+        }
+    }
+
+    let mmap_base = USER_MMAP_BASE + pid as u64 * USER_MMAP_STRIDE;
+    if let Some(pdpt_phys) =
+        table_entry_address(kernel_pml4 as *mut u64, pml4_index(mmap_base))
+    {
+        let pdpt_idx = pdpt_index(mmap_base);
+        if let Some(pd_phys) = table_entry_address(pdpt_phys as *mut u64, pdpt_idx) {
+            let pd = pd_phys as *mut u64;
+            for pd_idx in 0..PAGE_TABLE_ENTRIES {
+                if let Some(pt_phys) = table_entry_address(pd, pd_idx) {
+                    free_phys_page(pt_phys);
+                }
+            }
+            free_phys_page(pd_phys);
+            unsafe {
+                (pdpt_phys as *mut u64).add(pdpt_idx).write_volatile(0);
+                invlpg(mmap_base);
+            }
+        }
     }
 }
 
@@ -4738,14 +4808,16 @@ fn run_ready_task(child_index: usize) -> i32 {
         let program: extern "sysv64" fn(*const RymosAbi) -> i32 = core::mem::transmute(entry);
         let code = program(&RYMOS_ABI);
 
-        // A "fire and forget" spawn this child never waited on would
-        // otherwise never run at all now that spawn() only enqueues --
-        // drain them here so every spawn still definitely executes.
+        // Defense in depth (see `spawn_prepared`'s docs): nothing should ever
+        // actually be `Ready` here under today's eager spawn, but if a
+        // grandchild is ever left pending, drain it before this process's
+        // own exit finalizes.
         while let Some(grandchild) = find_ready_child_of(child_pid) {
             run_ready_task(grandchild);
         }
 
         let reclaimed = process_reclaim_mappings(child_index);
+        reclaim_process_window_tables(child_pid);
         destroy_process_address_space(child_pml4);
         {
             let table = &raw mut PROCESS_TABLE;
@@ -5398,6 +5470,7 @@ fn run_program(console: &mut Console, bootfs: BootFs, name: &[u8], args: &[u8]) 
         app_close_all_fds();
         reset_app_std_fds();
         let reclaimed = process_reclaim_mappings(process_index);
+        reclaim_process_window_tables(APP_PID);
         app_clear_heap_window();
         APP_CONSOLE = core::ptr::null_mut();
         APP_BOOTFS = BootFs::empty();
@@ -6110,6 +6183,346 @@ unsafe fn serial_write_byte(byte: u8) {
 
 unsafe fn keyboard_has_data() -> bool {
     unsafe { inb(KEYBOARD_STATUS) & 1 != 0 }
+}
+
+// --- CPU exception handling -------------------------------------------------
+//
+// Before this, this kernel had no IDT at all: any fault (a null-pointer read,
+// a bad guard-page access, an out-of-bounds write) triple-faulted the whole
+// machine with zero diagnostics -- QEMU just silently reset. This installs
+// handlers for the 32 CPU exception vectors that print a clear diagnostic
+// over serial (vector, mnemonic, error code, faulting RIP, CR2 for page
+// faults, and the current process if one is running) and then halt, instead
+// of an unexplained reboot.
+//
+// Deliberately *not* attempted: recovering and continuing (killing just the
+// offending process while the rest of the OS keeps running). That needs a
+// prepared non-local-exit point to unwind out of the arbitrary nested Rust
+// call stack a fault can land in -- a real, separate piece of work, not a
+// bounded extension of this. Also not attempted: a dedicated IST/TSS stack
+// for the double-fault handler, so a double fault caused by genuine kernel
+// stack exhaustion could still (rarely) overrun into a real triple fault
+// when the handler itself has no stack room left -- every other fault still
+// gets a clean diagnostic.
+//
+// No GDT is built here either: the kernel has run entirely on whichever GDT
+// UEFI's firmware set up (never replaced, only paging got its own kernel-
+// owned tables via `vmclone`), and since we're already executing through it
+// in 64-bit ring 0, its active `cs` selector is exactly the one IDT gate
+// descriptors need -- read at init time instead of assuming a fixed value.
+
+const IDT_LEN: usize = 32;
+const IDT_GATE_PRESENT_INTERRUPT: u8 = 0x8E;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct IdtEntry {
+    offset_low: u16,
+    selector: u16,
+    ist: u8,
+    type_attr: u8,
+    offset_mid: u16,
+    offset_high: u32,
+    reserved: u32,
+}
+
+impl IdtEntry {
+    const fn missing() -> Self {
+        Self {
+            offset_low: 0,
+            selector: 0,
+            ist: 0,
+            type_attr: 0,
+            offset_mid: 0,
+            offset_high: 0,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C, packed)]
+struct IdtPointer {
+    limit: u16,
+    base: u64,
+}
+
+static mut IDT: [IdtEntry; IDT_LEN] = [IdtEntry::missing(); IDT_LEN];
+
+/// The CPU-pushed frame below the vector number and error code every stub
+/// normalizes onto the stack (see the `isr_stub_*` macros). Same-privilege
+/// fault (we only ever run ring 0), so there's no stack-segment switch
+/// involved beyond what's listed here.
+#[repr(C)]
+struct InterruptStackFrame {
+    instruction_pointer: u64,
+    code_segment: u64,
+    cpu_flags: u64,
+    stack_pointer: u64,
+    stack_segment: u64,
+}
+
+/// Exact layout each `isr_stub_*` leaves on the stack before jumping to
+/// `isr_common`: the vector number and error code it normalized (a real
+/// hardware-pushed one for vectors that have one, a fake `0` pushed by the
+/// stub itself otherwise -- see `vector_info` for which is which), directly
+/// followed by the CPU's own `InterruptStackFrame`.
+#[repr(C)]
+struct RawExceptionFrame {
+    vector: u64,
+    error_code: u64,
+    frame: InterruptStackFrame,
+}
+
+/// Mnemonic plus whether this vector's error code (see `RawExceptionFrame`)
+/// is a real one from the CPU rather than the stub's own filler `0`.
+fn vector_info(vector: u8) -> (&'static str, bool) {
+    match vector {
+        0 => ("divide error", false),
+        1 => ("debug", false),
+        2 => ("non-maskable interrupt", false),
+        3 => ("breakpoint", false),
+        4 => ("overflow", false),
+        5 => ("bound range exceeded", false),
+        6 => ("invalid opcode", false),
+        7 => ("device not available", false),
+        8 => ("double fault", true),
+        10 => ("invalid TSS", true),
+        11 => ("segment not present", true),
+        12 => ("stack fault", true),
+        13 => ("general protection fault", true),
+        14 => ("page fault", true),
+        16 => ("x87 floating point", false),
+        17 => ("alignment check", true),
+        18 => ("machine check", false),
+        19 => ("SIMD floating point", false),
+        20 => ("virtualization", false),
+        21 => ("control protection", true),
+        _ => ("unknown", false),
+    }
+}
+
+fn read_cr2() -> u64 {
+    let value: u64;
+    unsafe {
+        asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+fn fault_print(text: &str) {
+    for byte in text.bytes() {
+        unsafe {
+            serial_write_byte(byte);
+        }
+    }
+}
+
+fn fault_print_hex(value: u64) {
+    fault_print("0x");
+    let mut started = false;
+    for shift in (0..16).rev() {
+        let nibble = ((value >> (shift * 4)) & 0xF) as u8;
+        if nibble != 0 || started || shift == 0 {
+            started = true;
+            let digit = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + (nibble - 10)
+            };
+            unsafe {
+                serial_write_byte(digit);
+            }
+        }
+    }
+}
+
+/// Common diagnostic path for every installed exception vector: print what
+/// faulted and where, then halt. Written to depend on as little of the rest
+/// of the kernel as possible (raw serial writes, not the `Console`/
+/// `APP_CONSOLE` machinery) since a fault can land here from literally
+/// anywhere -- including before any process, or even the shell, has set up
+/// console state.
+fn report_fault(vector: u8, mnemonic: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
+    fault_print("\r\n!! CPU EXCEPTION vector=");
+    fault_print_hex(vector as u64);
+    fault_print(" (");
+    fault_print(mnemonic);
+    fault_print(")\r\n");
+    if let Some(code) = error_code {
+        fault_print("   error_code=");
+        fault_print_hex(code);
+        fault_print("\r\n");
+    }
+    if vector == 14 {
+        fault_print("   cr2 (fault address)=");
+        fault_print_hex(read_cr2());
+        fault_print("\r\n");
+    }
+    fault_print("   rip=");
+    fault_print_hex(frame.instruction_pointer);
+    fault_print(" cs=");
+    fault_print_hex(frame.code_segment);
+    fault_print(" rflags=");
+    fault_print_hex(frame.cpu_flags);
+    fault_print("\r\n   rsp=");
+    fault_print_hex(frame.stack_pointer);
+    fault_print(" ss=");
+    fault_print_hex(frame.stack_segment);
+    fault_print("\r\n");
+    unsafe {
+        let index = APP_PROCESS_INDEX;
+        if index < PROCESS_COUNT {
+            let table = &raw const PROCESS_TABLE;
+            let process = &(*table)[index];
+            fault_print("   pid=");
+            fault_print_hex(process.pid as u64);
+            fault_print(" name=");
+            fault_print(core::str::from_utf8(&process.name[..process.name_len]).unwrap_or("?"));
+            fault_print("\r\n");
+        } else {
+            fault_print("   (fault outside any process context)\r\n");
+        }
+    }
+    fault_print("!! halting\r\n");
+    loop {
+        unsafe {
+            asm!("cli", "hlt", options(nomem, nostack));
+        }
+    }
+}
+
+/// Common landing point every `isr_stub_*` jumps to once it has normalized
+/// the stack to a `RawExceptionFrame` layout. `rdi` already holds a pointer
+/// to that frame (the SysV ABI's first integer argument register) by the
+/// time this runs, exactly as if it had been `call`ed with that one pointer
+/// argument -- diverging, so the stubs never need to restore anything or
+/// `iretq` back.
+extern "sysv64" fn isr_common_entry(raw: *const RawExceptionFrame) -> ! {
+    let raw = unsafe { &*raw };
+    let vector = raw.vector as u8;
+    let (mnemonic, has_error_code) = vector_info(vector);
+    let error_code = if has_error_code { Some(raw.error_code) } else { None };
+    report_fault(vector, mnemonic, &raw.frame, error_code);
+}
+
+/// The x86-interrupt calling convention is unstable (nightly-only), and this
+/// kernel builds on stable, so each vector gets a small hand-written naked
+/// stub instead: normalize the stack to a `RawExceptionFrame` (pushing a
+/// filler `0` error code first for vectors the CPU doesn't supply one for,
+/// so every vector ends up with the exact same layout regardless), point
+/// `rdi` at it, 16-byte-align `rsp` for the SysV ABI, and jump into the one
+/// shared `isr_common_entry`. Never returns, so there's no epilogue/`iretq`
+/// to get right -- every installed handler just diagnoses and halts.
+macro_rules! isr_stub_noerr {
+    ($name:ident, $vector:literal) => {
+        #[unsafe(naked)]
+        extern "sysv64" fn $name() -> ! {
+            core::arch::naked_asm!(
+                "push 0",
+                concat!("push ", $vector),
+                "mov rdi, rsp",
+                "and rsp, -16",
+                "call {entry}",
+                entry = sym isr_common_entry,
+            )
+        }
+    };
+}
+
+macro_rules! isr_stub_err {
+    ($name:ident, $vector:literal) => {
+        #[unsafe(naked)]
+        extern "sysv64" fn $name() -> ! {
+            core::arch::naked_asm!(
+                concat!("push ", $vector),
+                "mov rdi, rsp",
+                "and rsp, -16",
+                "call {entry}",
+                entry = sym isr_common_entry,
+            )
+        }
+    };
+}
+
+isr_stub_noerr!(isr_stub_0, 0);
+isr_stub_noerr!(isr_stub_1, 1);
+isr_stub_noerr!(isr_stub_2, 2);
+isr_stub_noerr!(isr_stub_3, 3);
+isr_stub_noerr!(isr_stub_4, 4);
+isr_stub_noerr!(isr_stub_5, 5);
+isr_stub_noerr!(isr_stub_6, 6);
+isr_stub_noerr!(isr_stub_7, 7);
+isr_stub_err!(isr_stub_8, 8);
+isr_stub_err!(isr_stub_10, 10);
+isr_stub_err!(isr_stub_11, 11);
+isr_stub_err!(isr_stub_12, 12);
+isr_stub_err!(isr_stub_13, 13);
+isr_stub_err!(isr_stub_14, 14);
+isr_stub_noerr!(isr_stub_16, 16);
+isr_stub_err!(isr_stub_17, 17);
+isr_stub_noerr!(isr_stub_18, 18);
+isr_stub_noerr!(isr_stub_19, 19);
+isr_stub_noerr!(isr_stub_20, 20);
+isr_stub_err!(isr_stub_21, 21);
+
+fn set_idt_gate(vector: usize, handler: u64, selector: u16) {
+    unsafe {
+        let idt = &raw mut IDT;
+        (*idt)[vector] = IdtEntry {
+            offset_low: handler as u16,
+            selector,
+            ist: 0,
+            type_attr: IDT_GATE_PRESENT_INTERRUPT,
+            offset_mid: (handler >> 16) as u16,
+            offset_high: (handler >> 32) as u32,
+            reserved: 0,
+        };
+    }
+}
+
+/// Installs handlers for every CPU exception vector RYMOS currently expects
+/// to ever see, then loads the IDT. Vectors Intel reserves and never
+/// generates (9, 15, 22-31) are left `present = 0` on purpose: if one ever
+/// somehow fired, using a not-present gate raises #GP instead, which we do
+/// handle, so it still gets a diagnostic rather than a triple fault.
+fn init_idt() {
+    unsafe {
+        asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    let cs: u16;
+    unsafe {
+        asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
+    }
+
+    set_idt_gate(0, isr_stub_0 as *const () as u64, cs);
+    set_idt_gate(1, isr_stub_1 as *const () as u64, cs);
+    set_idt_gate(2, isr_stub_2 as *const () as u64, cs);
+    set_idt_gate(3, isr_stub_3 as *const () as u64, cs);
+    set_idt_gate(4, isr_stub_4 as *const () as u64, cs);
+    set_idt_gate(5, isr_stub_5 as *const () as u64, cs);
+    set_idt_gate(6, isr_stub_6 as *const () as u64, cs);
+    set_idt_gate(7, isr_stub_7 as *const () as u64, cs);
+    set_idt_gate(8, isr_stub_8 as *const () as u64, cs);
+    set_idt_gate(10, isr_stub_10 as *const () as u64, cs);
+    set_idt_gate(11, isr_stub_11 as *const () as u64, cs);
+    set_idt_gate(12, isr_stub_12 as *const () as u64, cs);
+    set_idt_gate(13, isr_stub_13 as *const () as u64, cs);
+    set_idt_gate(14, isr_stub_14 as *const () as u64, cs);
+    set_idt_gate(16, isr_stub_16 as *const () as u64, cs);
+    set_idt_gate(17, isr_stub_17 as *const () as u64, cs);
+    set_idt_gate(18, isr_stub_18 as *const () as u64, cs);
+    set_idt_gate(19, isr_stub_19 as *const () as u64, cs);
+    set_idt_gate(20, isr_stub_20 as *const () as u64, cs);
+    set_idt_gate(21, isr_stub_21 as *const () as u64, cs);
+
+    unsafe {
+        let idt = &raw const IDT;
+        let pointer = IdtPointer {
+            limit: (core::mem::size_of::<[IdtEntry; IDT_LEN]>() - 1) as u16,
+            base: idt as u64,
+        };
+        asm!("lidt [{}]", in(reg) &pointer, options(nostack, preserves_flags));
+    }
 }
 
 #[panic_handler]

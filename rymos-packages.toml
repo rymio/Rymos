@@ -44,6 +44,14 @@ install = "programs/cmdapi.elf"
 enabled = true
 
 [[program]]
+name = "faultcheck"
+package = "rymos-program-faultcheck"
+bin = "faultcheck"
+source = "programs/faultcheck"
+install = "programs/faultcheck.elf"
+enabled = true
+
+[[program]]
 name = "fswalk"
 package = "rymos-program-fswalk"
 bin = "fswalk"
