@@ -42,7 +42,7 @@ forked `rustc` toolchain under `toolchain/rust`), see
 RYMOS now has the first serious self-hosting substrate, but not a native Rust
 toolchain yet.
 
-- ABI v21 runs trusted `no_std` ELF programs through `rymos-user`.
+- ABI v22 runs trusted `no_std` ELF programs through `rymos-user`.
 - RYMFS5 persists files up to 256 MiB with 256 compact metadata entries and
   96-byte names, nested directories, unlink/rename, append, create-new,
   seek, stat, and list, created/modified tick timestamps, a permission-style
@@ -71,7 +71,9 @@ toolchain yet.
   guard-page touch, a bad pointer, a divide-by-zero) into a clear serial
   diagnostic and a clean halt instead of a silent QEMU reset.
 - Runtime support includes `alloc::Vec`/`String`, argv reads, env get/set/remove,
-  cwd/path handling, errno-style `last_error`, monotonic ticks, and a `stdish`
+  cwd/path handling, errno-style `last_error`, calibrated monotonic ticks
+  (real nanoseconds since boot, not raw `rdtsc` cycles), real wall-clock time
+  via the CMOS RTC, a real `sleep_nanos`, terminal size, and a `stdish`
   shim for early fs/env/process/io/time/path/temp-dir/error work.
 - Boot smoke programs prove the current surface: `cmdapi`, `fswalk`,
   `heapstress`, `stdshim`, `echoin`, `allocdemo`, `rysh`, and (a genuine `std`
@@ -95,6 +97,68 @@ toolchain yet.
 See `docs/rust-port-roadmap.md` for the detailed cargo/rustc port sequence.
 
 ## Recently Closed
+
+- **Calibrated time, sleep, wall clock, and terminal size** (category 4):
+  `time_ticks` used to be a raw `rdtsc` read with no defined relationship to
+  real time -- fine for ordering, meaningless for duration math. Added
+  `calibrate_tsc`, which measures `rdtsc` ticks per second once at boot by
+  polling the legacy PIT's channel 2: arm a known countdown, read `rdtsc`
+  before and after, see how many ticks elapsed while a known amount of real
+  time passed. Entirely by polling -- no timer interrupt needed, consistent
+  with this kernel deliberately having none beyond the CPU exception
+  handlers category 3 added. Averaged across 4 rounds (the PIT's 16-bit
+  counter caps one run at ~55 ms) to reduce jitter from trusting a single
+  short sample. ABI v22's `time_ticks` now returns real calibrated
+  nanoseconds since boot.
+
+  Real wall-clock time exists now too: `time_unix_nanos` reads the CMOS RTC
+  once at boot (BCD-or-binary, 12-or-24-hour, using the classic
+  wait-for-UIP-then-double-read technique to avoid a torn read mid-tick),
+  paired with the calibration's boot `rdtsc` snapshot so later reads are
+  cheap (boot reading plus nanoseconds elapsed since, no repeated CMOS I/O).
+  Converted to a Unix timestamp via Howard Hinnant's `days_from_civil`
+  algorithm rather than a hand-rolled (and easy to get subtly wrong around
+  leap years) month-length table. The CMOS year register is only two
+  digits with no standardized century register, so this assumes the 21st
+  century -- disclosed, good enough for a log timestamp, not a substitute
+  for NTP.
+
+  `sleep_nanos` busy-waits against the calibrated clock. Correct, not a
+  placeholder: RYMOS has no scheduler to hand the CPU to during a sleep
+  regardless, so spinning is the real implementation here, the same
+  reasoning already applied to the exception handlers' halt loops.
+  `term_size` reports the console's real row/column count instead of
+  callers having to assume 80x25.
+
+  All four are wired end to end -- kernel ABI, `rymos-user`
+  (`time_ticks`/`time_unix_nanos`/`sleep_nanos`/`term_size`), and
+  `toolchain/rust`'s `std`: `sys::time::rymos`'s `Instant` duration
+  arithmetic and `SystemTime` are both genuinely real now (previously
+  `Instant`'s duration math was honestly `None` and `SystemTime` reused the
+  panicking `unsupported` stub, specifically because no calibration existed
+  yet -- see category 5). `std::thread::sleep` is real too: sleeping the
+  *current* (only) thread of execution needs no multi-threading support,
+  so reusing `sys::thread::unsupported`'s `Thread`/`available_parallelism`/
+  etc. (genuinely correct -- RYMOS is single-threaded per process) while
+  overriding just `sleep` was the right split, not an all-or-nothing choice.
+
+  Verified live in QEMU: `stdshim` sleeps 10 ms and confirms elapsed ticks
+  advanced by at least that much; a new wall-clock print showed a real,
+  plausible Unix timestamp. `stdreal` (the genuine `std` test program from
+  category 5) sleeps 15 ms via `std::thread::sleep` and measures ~15.14 ms
+  via real `Instant::checked_duration_since`; `SystemTime::now()
+  .duration_since(UNIX_EPOCH)` reported 20,652 days since epoch --
+  independently checked, that's mid-2026, matching the actual date, not
+  just "a number that didn't crash."
+
+  Assessed, scoped down deliberately: "terminal/TTY behavior beyond the
+  current console stream" turned out to be the vaguest of category 4's
+  three items, with no concrete downstream consumer identified yet (unlike
+  tick calibration, which category 5 had already surfaced a real,
+  documented need for). Did the cheap, clearly-real, bounded piece (a
+  terminal size query) rather than speculatively building out raw/cooked
+  mode switching or ANSI/VT100 escape handling with no consumer in sight --
+  left for whenever something actually needs it.
 
 - **Real `std::fs`/`std::env`/`std::time`/`std::random` wired onto the ABI**
   (category 5): before this, only `stdio` and the allocator were real in the
@@ -515,9 +579,16 @@ The remaining blockers are now narrower and more concrete:
      window: see Recently Closed
 
 4. Time, sync, and OS services:
-   - calibrate ticks into real wall/monotonic time units
-   - add sleep/timer behavior
-   - add terminal/TTY behavior beyond the current console stream
+   - calibrate ticks into real wall/monotonic time units -- done: PIT-based
+     `calibrate_tsc` at boot; see Recently Closed
+   - add sleep/timer behavior -- done: `sleep_nanos`, real
+     `std::thread::sleep`; see Recently Closed. Still just busy-waiting, no
+     timer interrupt -- correct for now (no scheduler to hand the CPU to
+     either), would need revisiting only alongside real preemption
+   - add terminal/TTY behavior beyond the current console stream -- narrowly
+     done (real terminal size query); raw/cooked mode switching and
+     ANSI/VT100 escape handling deliberately not attempted with no concrete
+     consumer identified yet -- see Recently Closed
    - (synchronization primitives for `std` turned out not to need new OS
      work: RYMOS is single-threaded per process today, so reusing `std`'s
      existing `no_threads` fallback is the *correct* answer, not a stub --

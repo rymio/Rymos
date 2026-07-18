@@ -8,7 +8,7 @@
 //! `rymos-packages.toml`/`autoexec.bat`.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
     println!("stdreal: real std::fs/env/time/process smoke test");
@@ -82,8 +82,22 @@ fn main() {
     let _ = std::fs::remove_file(path);
 
     let start = Instant::now();
+    std::thread::sleep(Duration::from_millis(15));
     let later = Instant::now();
     println!("stdreal Instant ordering (later >= start): {}", later >= start);
+    match later.checked_duration_since(start) {
+        Some(elapsed) => println!("stdreal Instant elapsed: {elapsed:?} (slept 15ms)"),
+        None => println!("stdreal Instant elapsed FAILED: checked_duration_since returned None"),
+    }
+
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(since_epoch) => println!(
+            "stdreal SystemTime since epoch: {} s ({} days)",
+            since_epoch.as_secs(),
+            since_epoch.as_secs() / 86_400
+        ),
+        Err(err) => println!("stdreal SystemTime FAILED: {err}"),
+    }
 
     let mut map = HashMap::new();
     map.insert("a", 1);

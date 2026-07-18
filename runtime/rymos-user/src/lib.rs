@@ -68,6 +68,9 @@ pub struct RymosAbi {
     pub dup2: extern "sysv64" fn(i32, i32) -> i32,
     pub argv_count: extern "sysv64" fn() -> usize,
     pub argv_get: extern "sysv64" fn(usize, *mut u8, usize) -> isize,
+    pub time_unix_nanos: extern "sysv64" fn() -> u64,
+    pub sleep_nanos: extern "sysv64" fn(u64),
+    pub term_size: extern "sysv64" fn(*mut usize, *mut usize) -> i32,
 }
 
 static mut ABI: *const RymosAbi = core::ptr::null();
@@ -1407,8 +1410,34 @@ pub fn mem_unmap_pages(address: usize, page_count: usize) -> bool {
     with_abi(|abi| (abi.mem_unmap_pages)(address as u64, page_count) == 0).unwrap_or(false)
 }
 
+/// Nanoseconds elapsed since boot, calibrated against the PIT at boot time
+/// (see `kernel/src/main.rs`'s `calibrate_tsc`) -- a real time unit, not raw
+/// `rdtsc` cycles.
 pub fn time_ticks() -> u64 {
     with_abi(|abi| (abi.time_ticks)()).unwrap_or(0)
+}
+
+/// Real wall-clock time as nanoseconds since the Unix epoch, or 0 if the
+/// CMOS RTC couldn't be read at boot.
+pub fn time_unix_nanos() -> u64 {
+    with_abi(|abi| (abi.time_unix_nanos)()).unwrap_or(0)
+}
+
+/// Busy-waits for at least `nanos` nanoseconds. RYMOS has no scheduler to
+/// hand the CPU to anything else during a sleep, so spinning against the
+/// calibrated clock is the real implementation, not a stand-in for one.
+pub fn sleep_nanos(nanos: u64) {
+    let _ = with_abi(|abi| {
+        (abi.sleep_nanos)(nanos);
+    });
+}
+
+/// The console's current (rows, cols) text grid size.
+pub fn term_size() -> Option<(usize, usize)> {
+    let mut rows = 0usize;
+    let mut cols = 0usize;
+    let ok = with_abi(|abi| (abi.term_size)(&mut rows, &mut cols))? == 0;
+    if ok { Some((rows, cols)) } else { None }
 }
 
 pub fn unlink(path: &[u8]) -> bool {

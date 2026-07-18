@@ -10,7 +10,7 @@ For the exact commands to set up a machine and rebuild everything by hand
 
 ## Current Foundation
 
-- ABI v21 program entry through `rymos-user`.
+- ABI v22 program entry through `rymos-user`.
 - BootFS read handles and RYMFS read/write/seek handles.
 - Nested RYMFS directories within the compact path limit.
 - RYMFS unlink/rename for files and empty directories.
@@ -111,6 +111,61 @@ For the exact commands to set up a machine and rebuild everything by hand
   with heap reclaimed. Still stubbed at the time: `sys::fs`, `sys::env`,
   `sys::process`, `sys::time`, real randomness, real errno mapping -- see the
   next entry for all of those.
+
+- **Calibrated time, real sleep, wall clock, and terminal size** (category
+  4): `time_ticks` used to be a raw `rdtsc` read with no defined
+  relationship to real time -- fine for ordering, meaningless for duration
+  math (exactly what left `std::time::Instant`'s duration arithmetic
+  honestly unsupported in category 5, just above). `calibrate_tsc` measures
+  `rdtsc` ticks per second once at boot by polling the legacy PIT's channel
+  2 (arm a known countdown, `rdtsc` before/after, see how many ticks
+  elapsed over a known real-time interval) -- entirely by polling, no timer
+  interrupt needed, consistent with this kernel deliberately having none
+  beyond category 3's CPU exception handlers. Averaged across 4 rounds
+  (the PIT's 16-bit counter caps one run at ~55 ms) to reduce jitter from a
+  single short sample. ABI v22's `time_ticks` now returns real calibrated
+  nanoseconds since boot.
+
+  Real wall-clock time exists too: `time_unix_nanos` reads the CMOS RTC
+  once at boot (BCD-or-binary, 12-or-24-hour, the classic
+  wait-for-UIP-then-double-read technique against a torn read), paired with
+  the calibration's boot `rdtsc` snapshot so later reads are cheap. Days
+  since epoch via Howard Hinnant's `days_from_civil` algorithm rather than a
+  hand-rolled month-length table (easy to get subtly wrong around leap
+  years). The CMOS year register is only two digits with no standardized
+  century register, so this assumes the 21st century -- disclosed, fine for
+  a log timestamp, not an NTP substitute.
+
+  `sleep_nanos` busy-waits against the calibrated clock -- correct, not a
+  placeholder, since RYMOS has no scheduler to hand the CPU to during a
+  sleep regardless. `term_size` reports the console's real row/column count.
+
+  All four wired end to end: kernel ABI (v22), `rymos-user`, and
+  `toolchain/rust`'s `std` -- `sys::time::rymos`'s `Instant` duration
+  arithmetic and `SystemTime` are both genuinely real now (previously
+  `Instant`'s duration math was honestly `None` and `SystemTime` reused the
+  panicking `unsupported` stub specifically because no calibration existed
+  yet). `std::thread::sleep` is real too: sleeping the *current* thread
+  needs no multi-threading support, so reusing `sys::thread::unsupported`'s
+  `Thread`/`available_parallelism`/etc. (genuinely correct -- RYMOS stays
+  single-threaded per process) while overriding just `sleep` was the right
+  split, not all-or-nothing.
+
+  Verified live in QEMU: `stdshim` sleeps 10 ms and confirms elapsed ticks
+  advanced by at least that much, plus a wall-clock print showing a real,
+  plausible timestamp; `stdreal` sleeps 15 ms via `std::thread::sleep` and
+  measures ~15.14 ms via real `Instant::checked_duration_since`;
+  `SystemTime::now().duration_since(UNIX_EPOCH)` reported 20,652 days since
+  epoch -- independently checked, that's mid-2026, matching the actual
+  date, not just "a number that didn't crash."
+
+  Assessed, scoped down deliberately: "terminal/TTY behavior beyond the
+  current console stream" was the vaguest of the three original items, with
+  no concrete downstream consumer identified (unlike tick calibration,
+  which category 5 had already surfaced a real, documented need for). Did
+  the cheap, clearly-real, bounded piece (terminal size) rather than
+  speculatively building raw/cooked mode switching or ANSI/VT100 escape
+  handling with no consumer in sight.
 
 - **Real `std::fs`/`std::env`/`std::time`/`std::random` wired onto the ABI**
   (category 5): `sys::pal::rymos::abi`'s `RymosAbi` struct previously only
@@ -411,8 +466,9 @@ For the exact commands to set up a machine and rebuild everything by hand
      `rymos-user::Command` builder used by `no_std` programs; `std`'s own
      `std::process::Command` stays unsupported for a different, architectural
      reason -- see Current Foundation)
-   - calibrated time/clock calls (also blocks `std::time::Instant`'s duration
-     arithmetic -- see Current Foundation and category 4)
+   - calibrated time/clock calls -- done: PIT-based `calibrate_tsc` at boot
+     plus CMOS RTC wall-clock reads unblocked `std::time::Instant`'s duration
+     arithmetic and a real `SystemTime`; see Current Foundation
    - randomness stub or driver -- done at the `std` level: `sys::random`
      does `RDRAND`-or-TSC-seeded-fallback; see Current Foundation
    - richer path normalization beyond the compact RYMFS path limit
@@ -420,9 +476,10 @@ For the exact commands to set up a machine and rebuild everything by hand
      set is still small; `std`-level mapping of what exists today onto
      `io::ErrorKind` is done -- see Current Foundation)
    - wire `sys::fs`/`sys::env`/`sys::process`/`sys::time` onto the real ABI --
-     done for `fs`/`env`/`time` (ordering only); `std::process::Command`
-     deliberately still unsupported, a real design mismatch rather than a
-     bounded wiring gap -- see Current Foundation
+     done for `fs`/`env`/`time` (ordering *and* duration arithmetic now, plus
+     a real `SystemTime`); `std::process::Command` deliberately still
+     unsupported, a real design mismatch rather than a bounded wiring gap --
+     see Current Foundation
 
 4. Memory:
    - page-table page reclaim for the shared heap/mmap windows -- done:
@@ -441,7 +498,7 @@ For the exact commands to set up a machine and rebuild everything by hand
 
 ## Port Order
 
-1. Keep `no_std` programs working against ABI v21.
+1. Keep `no_std` programs working against ABI v22.
 2. Build `core` and `compiler_builtins` for `x86_64-rymos`. Done: verified via
    `RYMOS_TARGET_MODE=custom` building and installing `hello`.
 3. Add a tiny `std` compatibility shim for file/env/time/process basics.

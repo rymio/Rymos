@@ -16,6 +16,12 @@ const TEXT_ROWS_MAX: usize = 48;
 const COM1: u16 = 0x3F8;
 const KEYBOARD_DATA: u16 = 0x60;
 const KEYBOARD_STATUS: u16 = 0x64;
+const PIT_CHANNEL2_DATA: u16 = 0x42;
+const PIT_COMMAND: u16 = 0x43;
+const PIT_INPUT_HZ: u64 = 1_193_182;
+const NMI_STATUS_CONTROL: u16 = 0x61;
+const CMOS_INDEX: u16 = 0x70;
+const CMOS_DATA: u16 = 0x71;
 const INPUT_MAX: usize = 128;
 const FILE_COUNT: usize = 12;
 const FILE_NAME_MAX: usize = 16;
@@ -190,6 +196,9 @@ struct RymosAbi {
     dup2: extern "sysv64" fn(i32, i32) -> i32,
     argv_count: extern "sysv64" fn() -> usize,
     argv_get: extern "sysv64" fn(usize, *mut u8, usize) -> isize,
+    time_unix_nanos: extern "sysv64" fn() -> u64,
+    sleep_nanos: extern "sysv64" fn(u64),
+    term_size: extern "sysv64" fn(*mut usize, *mut usize) -> i32,
 }
 
 #[repr(C)]
@@ -550,6 +559,19 @@ static mut NEXT_PID: u32 = 1;
 static mut KERNEL_BOOT_INFO: *const BootInfo = core::ptr::null();
 static mut PHYS_ALLOCATOR: PhysPageAllocator = PhysPageAllocator::empty();
 static mut KERNEL_PML4_PHYS: u64 = 0;
+/// `rdtsc` ticks per second, measured once at boot against the PIT (see
+/// `calibrate_tsc`). Zero until calibration runs; every ns-conversion
+/// function below falls back to treating raw ticks as nanoseconds (wrong,
+/// but only until `calibrate_tsc` runs a few lines into `_start` -- nothing
+/// reads time before that).
+static mut TSC_HZ: u64 = 0;
+/// `rdtsc` value captured immediately after calibration; every later time
+/// reading is expressed as nanoseconds elapsed since this point.
+static mut BOOT_TSC: u64 = 0;
+/// Real Unix time (nanoseconds) read from the CMOS RTC at the same moment
+/// `BOOT_TSC` was captured, or 0 if the RTC couldn't be read. Wall-clock
+/// time is this plus nanoseconds elapsed since `BOOT_TSC`.
+static mut BOOT_UNIX_NANOS: u64 = 0;
 static mut NEXT_SCRATCH_VIRT: u64 = KERNEL_SCRATCH_BASE;
 static mut APP_HEAP_BASE: u64 = 0;
 static mut APP_HEAP_NEXT: u64 = 0;
@@ -565,7 +587,7 @@ static ENV: [(&[u8], &[u8]); ENV_COUNT] = [
     (b"TMPDIR", b"pfs:tmp"),
 ];
 static RYMOS_ABI: RymosAbi = RymosAbi {
-    version: 21,
+    version: 22,
     write: abi_write,
     pid: abi_pid,
     args: abi_args,
@@ -601,6 +623,9 @@ static RYMOS_ABI: RymosAbi = RymosAbi {
     dup2: abi_dup2,
     argv_count: abi_argv_count,
     argv_get: abi_argv_get,
+    time_unix_nanos: abi_time_unix_nanos,
+    sleep_nanos: abi_sleep_nanos,
+    term_size: abi_term_size,
 };
 
 #[unsafe(no_mangle)]
@@ -615,6 +640,17 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         init_physical_allocator(boot_info);
     }
     init_idt();
+
+    unsafe {
+        TSC_HZ = calibrate_tsc();
+        // Read the RTC first (it can take a little real time -- see
+        // `read_rtc_unix_seconds`'s UIP wait/double-read) so `BOOT_TSC`,
+        // captured right after, lines up with the wall-clock reading it's
+        // paired with as closely as possible.
+        let unix_seconds = read_rtc_unix_seconds();
+        BOOT_TSC = read_tsc();
+        BOOT_UNIX_NANOS = unix_seconds.saturating_mul(1_000_000_000);
+    }
 
     console.clear();
     console.write_line("RYMOS minimal Rust kernel");
@@ -2788,6 +2824,165 @@ fn read_tsc() -> u64 {
         asm!("rdtsc", out("edx") high, out("eax") low, options(nomem, nostack, preserves_flags));
     }
     ((high as u64) << 32) | low as u64
+}
+
+/// Measures `rdtsc` ticks per second against the legacy PIT's channel 2,
+/// entirely by polling -- no timer interrupt needed (this kernel still has
+/// none, deliberately, see the IDT's docs). Classic technique: arm channel 2
+/// for a known countdown, read `rdtsc` before and after, and see how many
+/// ticks elapsed while a known amount of real time passed.
+///
+/// Repeats the one-shot countdown (the PIT's 16-bit counter caps a single
+/// run at ~54.9 ms) a few times and accumulates both sides of the ratio
+/// across all of them, rather than trusting one ~50 ms sample -- a single
+/// short sample is more exposed to scheduling/emulation jitter around the
+/// two `rdtsc` reads.
+fn calibrate_tsc() -> u64 {
+    const COUNT: u16 = 59_659; // ~50 ms at the PIT's fixed 1.193182 MHz input
+    const ROUNDS: u32 = 4;
+
+    let mut total_ticks: u64 = 0;
+    for _ in 0..ROUNDS {
+        unsafe {
+            // Gate channel 2 on, speaker off.
+            let nmi = inb(NMI_STATUS_CONTROL);
+            outb(NMI_STATUS_CONTROL, (nmi & 0xFC) | 0x01);
+            // Channel 2, lobyte/hibyte access, mode 0 (interrupt on terminal
+            // count -- here just used as a one-shot countdown), binary.
+            outb(PIT_COMMAND, 0xB0);
+            outb(PIT_CHANNEL2_DATA, (COUNT & 0xFF) as u8);
+            outb(PIT_CHANNEL2_DATA, (COUNT >> 8) as u8);
+        }
+        let start = read_tsc();
+        // Bit 5 of the NMI status/control port is channel 2's OUT pin;
+        // mode 0 holds it low until the countdown reaches zero.
+        while unsafe { inb(NMI_STATUS_CONTROL) } & 0x20 == 0 {
+            spin_loop();
+        }
+        let end = read_tsc();
+        total_ticks += end.saturating_sub(start);
+    }
+
+    let total_seconds_numerator = COUNT as u64 * ROUNDS as u64;
+    ((total_ticks as u128 * PIT_INPUT_HZ as u128) / total_seconds_numerator as u128) as u64
+}
+
+/// Nanoseconds elapsed since `BOOT_TSC`, using the calibrated `TSC_HZ`. Falls
+/// back to treating raw ticks as nanoseconds if calibration hasn't run yet
+/// (never actually observed -- `calibrate_tsc` runs before anything else
+/// could call this -- but a fallback here is cheap and avoids a divide by
+/// zero if that ever changed).
+fn ns_since_boot() -> u64 {
+    let hz = unsafe { TSC_HZ };
+    let elapsed_ticks = read_tsc().saturating_sub(unsafe { BOOT_TSC });
+    if hz == 0 {
+        return elapsed_ticks;
+    }
+    ((elapsed_ticks as u128 * 1_000_000_000u128) / hz as u128) as u64
+}
+
+/// Real Unix time in nanoseconds: the CMOS RTC reading captured at boot,
+/// plus nanoseconds elapsed since then. Returns 0 if the RTC couldn't be
+/// read at boot (see `read_rtc_unix_seconds`), same convention as an
+/// unset/uncalibrated clock elsewhere in this kernel.
+fn unix_nanos_now() -> u64 {
+    let boot = unsafe { BOOT_UNIX_NANOS };
+    if boot == 0 {
+        return 0;
+    }
+    boot + ns_since_boot()
+}
+
+fn read_cmos_register(register: u8) -> u8 {
+    unsafe {
+        outb(CMOS_INDEX, register);
+        inb(CMOS_DATA)
+    }
+}
+
+fn bcd_to_binary(value: u8) -> u8 {
+    (value & 0x0F) + ((value >> 4) * 10)
+}
+
+/// Days since 1970-01-01 for a given (year, month 1-12, day 1-31), in the
+/// proleptic Gregorian calendar. Howard Hinnant's `days_from_civil`
+/// algorithm (public domain) -- correct for any date, not just a simple
+/// month-length table, without needing a full calendar library.
+fn days_from_civil(year: i64, month: u8, day: u8) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let year_of_era = y - era * 400;
+    let month_index = ((month as i64 + 9) % 12) as i64;
+    let day_of_year = (153 * month_index + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Reads the current wall-clock time from the CMOS real-time clock, in
+/// whole seconds since the Unix epoch. Returns 0 if the read is obviously
+/// implausible (e.g. no RTC battery/chip at all), matching the "0 means
+/// unset" convention `BOOT_UNIX_NANOS` already uses.
+///
+/// The CMOS year register is only two digits -- there's no standardized
+/// "century" register firmware reliably populates across real hardware and
+/// emulators alike, so this assumes the 21st century. Good enough for a
+/// build timestamp or log entry; not a substitute for NTP.
+fn read_rtc_unix_seconds() -> u64 {
+    // The RTC can be mid-update when read; register 0x0A's top bit (UIP)
+    // marks that. Wait for it to clear first (bounded, so a genuinely
+    // absent/faulty RTC can't hang boot), then read all fields and confirm
+    // a second read agrees -- the classic double-read technique, since UIP
+    // can also flip on the boundary right after we saw it clear.
+    for _ in 0..100_000 {
+        if read_cmos_register(0x0A) & 0x80 == 0 {
+            break;
+        }
+        spin_loop();
+    }
+
+    let read_fields = || {
+        (
+            read_cmos_register(0x00), // seconds
+            read_cmos_register(0x02), // minutes
+            read_cmos_register(0x04), // hours
+            read_cmos_register(0x07), // day of month
+            read_cmos_register(0x08), // month
+            read_cmos_register(0x09), // year (2-digit)
+        )
+    };
+    let mut fields = read_fields();
+    for _ in 0..8 {
+        let again = read_fields();
+        if again == fields {
+            break;
+        }
+        fields = again;
+    }
+    let (mut second, mut minute, mut hour, mut day, mut month, mut year) = fields;
+
+    let status_b = read_cmos_register(0x0B);
+    if status_b & 0x04 == 0 {
+        // BCD mode (the common default): every field above is packed BCD.
+        second = bcd_to_binary(second);
+        minute = bcd_to_binary(minute);
+        let pm = hour & 0x80 != 0;
+        hour = bcd_to_binary(hour & 0x7F);
+        if status_b & 0x02 == 0 && pm {
+            hour = (hour % 12) + 12;
+        }
+        day = bcd_to_binary(day);
+        month = bcd_to_binary(month);
+        year = bcd_to_binary(year);
+    }
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return 0;
+    }
+
+    let full_year = 2000i64 + year as i64;
+    let days = days_from_civil(full_year, month, day);
+    let seconds_of_day = hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    (days * 86_400 + seconds_of_day).max(0) as u64
 }
 
 unsafe fn write_cr3(value: u64) {
@@ -4989,7 +5184,45 @@ extern "sysv64" fn abi_mem_unmap_pages(address: u64, page_count: usize) -> i32 {
 }
 
 extern "sysv64" fn abi_time_ticks() -> u64 {
-    read_tsc()
+    ns_since_boot()
+}
+
+/// Real wall-clock time as nanoseconds since the Unix epoch, or 0 if the
+/// CMOS RTC couldn't be read at boot (see `read_rtc_unix_seconds`).
+extern "sysv64" fn abi_time_unix_nanos() -> u64 {
+    unix_nanos_now()
+}
+
+/// Busy-waits for at least `nanos` nanoseconds. RYMOS has no timer
+/// interrupt or scheduler (see the process-model docs), so there is nothing
+/// else that could usefully run during a sleep anyway -- spinning against
+/// the calibrated TSC is the correct implementation here, not a placeholder
+/// for a real one.
+extern "sysv64" fn abi_sleep_nanos(nanos: u64) {
+    let start = ns_since_boot();
+    while ns_since_boot().saturating_sub(start) < nanos {
+        spin_loop();
+    }
+}
+
+/// Reports the console's current text grid size. Real hardware/OVMF's GOP
+/// framebuffer mode is fixed for the whole boot (`1024x768`, see
+/// `Console::new`), so this never changes after start, but it's still real
+/// -- not a hardcoded guess -- for programs that want to lay out output
+/// without assuming 80x25.
+extern "sysv64" fn abi_term_size(rows_ptr: *mut usize, cols_ptr: *mut usize) -> i32 {
+    if rows_ptr.is_null() || cols_ptr.is_null() {
+        return set_app_error(ERR_INVAL);
+    }
+    let Some(console) = (unsafe { APP_CONSOLE.as_ref() }) else {
+        return set_app_error(ERR_INVAL);
+    };
+    unsafe {
+        rows_ptr.write(console.rows);
+        cols_ptr.write(console.cols);
+    }
+    clear_app_error();
+    0
 }
 
 extern "sysv64" fn abi_unlink(path_ptr: *const u8, path_len: usize) -> i32 {

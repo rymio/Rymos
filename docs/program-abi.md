@@ -4,7 +4,7 @@ RYMOS programs are Rust-first, `no_std` ELF binaries.
 
 Current ABI status:
 
-- ABI version: `21`
+- ABI version: `22`
 - Architecture: `x86_64`
 - Format: ELF64
 - Runtime crate: `runtime/rymos-user`
@@ -31,7 +31,12 @@ Current ABI status:
   `env_set`, and `env_remove`
 - Memory: `mem_alloc_pages` maps zeroed pages for runtime heap growth;
   `mem_map_pages` and `mem_unmap_pages` provide mmap-like regions
-- Time: `time_ticks` returns monotonic CPU ticks
+- Time: `time_ticks` returns calibrated monotonic nanoseconds since boot
+  (real nanoseconds, not raw `rdtsc` cycles -- calibrated against the PIT at
+  boot); `time_unix_nanos` returns real wall-clock time (CMOS RTC read at
+  boot, 0 if unavailable); `sleep_nanos` busy-waits for at least the given
+  duration
+- Terminal: `term_size` reports the console's current row/column count
 - Function signature:
 
 ```rust
@@ -82,6 +87,9 @@ pub struct RymosAbi {
     pub dup2: extern "sysv64" fn(i32, i32) -> i32,
     pub argv_count: extern "sysv64" fn() -> usize,
     pub argv_get: extern "sysv64" fn(usize, *mut u8, usize) -> isize,
+    pub time_unix_nanos: extern "sysv64" fn() -> u64,
+    pub sleep_nanos: extern "sysv64" fn(u64),
+    pub term_size: extern "sysv64" fn(*mut usize, *mut usize) -> i32,
 }
 ```
 
@@ -186,8 +194,18 @@ page before and after the returned region.
 `mem_unmap_pages(address, page_count)` unmaps a region previously returned by
 `mem_map_pages` and returns `0`, or `-1` on error.
 
-`time_ticks()` returns a monotonic CPU timestamp counter value. It is not
-calibrated to wall-clock time yet.
+`time_ticks()` returns real, calibrated nanoseconds elapsed since boot.
+`calibrate_tsc` measures the CPU's `rdtsc` frequency once at boot by polling
+the legacy PIT's channel 2 (no timer interrupt needed), so this is a real
+time unit, not a raw cycle count.
+
+`time_unix_nanos()` returns real wall-clock time as nanoseconds since the
+Unix epoch, read from the CMOS RTC once at boot and combined with calibrated
+nanoseconds elapsed since. Returns `0` if the RTC couldn't be read.
+
+`sleep_nanos(nanos)` busy-waits for at least `nanos` nanoseconds against the
+calibrated clock. RYMOS has no scheduler to hand the CPU to during a sleep,
+so spinning is the real implementation, not a placeholder for a future one.
 
 `unlink(path_ptr, path_len)` removes a RYMFS file or empty directory. Paths
 must use `pfs:`.
@@ -210,6 +228,9 @@ writes the read/write descriptor numbers to caller memory.
 `dup2(old_fd, new_fd)` redirects standard fd `0`, `1`, or `2` to another open
 descriptor. Passing the same std fd for both arguments resets that std fd to
 its default console behavior.
+
+`term_size(rows_ptr, cols_ptr)` writes the console's current row and column
+count to caller memory and returns `0`, or `-1` on error.
 
 ## Core Runtime
 
@@ -336,11 +357,15 @@ Milestones 1 through 8 are complete:
   upgrade): files can now span up to 4 non-contiguous extents instead of one
   contiguous run, so fragmentation from other files no longer causes
   spurious "disk full" errors
+- ABI v22 `time_ticks` is now calibrated (real nanoseconds since boot, via a
+  PIT-based `calibrate_tsc` at boot -- previously raw `rdtsc` cycles), plus
+  new `time_unix_nanos` (real wall-clock time via the CMOS RTC),
+  `sleep_nanos` (real busy-wait sleep), and `term_size` (console row/column
+  count)
 
 ## Next ABI Milestones
 
 - Add `exit` as a kernel service instead of returning directly.
-- Reclaim page-table pages for exited process heap windows.
 - Add safe process spawning after isolated or relocatable app loading.
 - Add per-process environment.
 - Move from trusted kernel-mode apps to ring-3 userspace plus syscalls.

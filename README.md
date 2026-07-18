@@ -182,7 +182,7 @@ RYMOS can now run a tiny Rust `no_std` program from BootFS:
 run hello
 ```
 
-Programs are ELF64 binaries linked at `0x200000` and called with ABI v21:
+Programs are ELF64 binaries linked at `0x200000` and called with ABI v22:
 
 ```rust
 extern "sysv64" fn _start(abi: *const RymosAbi) -> i32
@@ -195,13 +195,15 @@ programs now implement `rymos_main()` and call runtime helpers such as
 
 For details, see `docs/program-abi.md`.
 
-ABI v21 currently supports console output, raw args, argv-preserving spawn,
+ABI v22 currently supports console output, raw args, argv-preserving spawn,
 argv-style reads, blocking line input, read-only BootFS file reads, BootFS
 read handles, RYMFS5 read/write/seek handles, file metadata/listing (with
 created/modified tick timestamps and a permission-style mode byte), compact
 nested RYMFS directories, RYMFS unlink/rename, process-local environment
 overrides, synchronous spawn/wait status, kernel-backed heap page allocation,
-standard descriptors, monotonic ticks, cwd/path resolution, errno-style
+standard descriptors, calibrated monotonic ticks (real nanoseconds since
+boot, not raw `rdtsc` cycles), real wall-clock time via the CMOS RTC, a real
+nanosecond-resolution sleep, terminal size, cwd/path resolution, errno-style
 `last_error`, process-local pipes, std fd redirection/inheritance, and exit
 codes by return value. Spawned children now run in their own isolated
 address space instead of the shared fixed-address window earlier milestones

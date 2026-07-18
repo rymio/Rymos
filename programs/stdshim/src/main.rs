@@ -106,6 +106,41 @@ fn rymos_main() -> i32 {
     rt::print("stdshim elapsed ticks ");
     rt::print_usize(start.elapsed_ticks() as usize);
     rt::write(b"\n");
+
+    // Category 4 regression: ticks are now calibrated nanoseconds (not raw
+    // TSC cycles), so sleeping for a known duration and checking elapsed
+    // ticks against it is a real, meaningful assertion -- it wouldn't have
+    // been before calibration existed.
+    const SLEEP_NANOS: u64 = 10_000_000; // 10 ms
+    let before = rt::time_ticks();
+    rt::sleep_nanos(SLEEP_NANOS);
+    let after = rt::time_ticks();
+    let slept = after.saturating_sub(before);
+    if slept < SLEEP_NANOS {
+        return fail(b"sleep_nanos returned early");
+    }
+    rt::print("stdshim slept ");
+    rt::print_usize(slept as usize);
+    rt::print(" ns (requested ");
+    rt::print_usize(SLEEP_NANOS as usize);
+    rt::write(b")\n");
+
+    match rt::term_size() {
+        Some((rows, cols)) if rows > 0 && cols > 0 => {
+            rt::print("stdshim term size ");
+            rt::print_usize(rows);
+            rt::print("x");
+            rt::print_usize(cols);
+            rt::write(b"\n");
+        }
+        _ => return fail(b"term_size"),
+    }
+
+    let unix_nanos = rt::time_unix_nanos();
+    rt::print("stdshim wall clock unix_nanos ");
+    rt::print_usize(unix_nanos as usize);
+    rt::write(b"\n");
+
     rt::println("stdshim: ok");
     0
 }
