@@ -1,5 +1,5 @@
 [package]
-name = "rymos-program-allocdemo"
+name = "rymos-program-stdshim"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
@@ -8,5 +8,5 @@ license.workspace = true
 rymos-user = { path = "../../runtime/rymos-user" }
 
 [[bin]]
-name = "allocdemo"
+name = "stdshim"
 path = "src/main.rs"

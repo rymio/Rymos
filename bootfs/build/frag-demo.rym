@@ -1,0 +1,23 @@
+# RYMOS RYMFS5 non-contiguous extent demo.
+#
+# Writes three files back-to-back (each spanning several sectors), deletes
+# the middle one to leave a hole smaller than the disk's remaining free
+# space, then writes a file too big to fit in that hole alone. Before
+# RYMFS5, this would report "disk full" as soon as no single contiguous run
+# was big enough, even with plenty of free space overall. RYMFS5 splits
+# allocation across up to 4 extents instead.
+#
+# Run `fsformat` from the console shell before this script; rysh scripts
+# don't expose fsformat/df as verbs.
+mkdir pfs:frag
+fillfile pfs:frag/a 3000
+fillfile pfs:frag/b 3000
+fillfile pfs:frag/c 3000
+stat pfs:frag/a
+stat pfs:frag/b
+stat pfs:frag/c
+rm pfs:frag/b
+fillfile pfs:frag/big 20000
+countfile pfs:frag/big
+stat pfs:frag/big
+listdir pfs:frag

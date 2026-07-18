@@ -3,7 +3,7 @@
 
 use rymos_user as rt;
 
-const SCRIPT_SIZE: usize = 1024;
+const SCRIPT_SIZE: usize = 2048;
 const MAX_VARS: usize = 8;
 const NAME_SIZE: usize = 16;
 const VALUE_SIZE: usize = 64;
@@ -182,6 +182,13 @@ fn run_line(line: &[u8], line_no: usize, args: &[u8], store: &mut VarStore) {
         b"getenv" => {
             getenv(rest);
         }
+        b"setenv" => {
+            let (key, value) = split_word(rest);
+            setenv(key, value);
+        }
+        b"unsetenv" => {
+            unsetenv(rest);
+        }
         b"spawn" => {
             let (name, args) = split_word(rest);
             spawn(name, args);
@@ -195,12 +202,39 @@ fn run_line(line: &[u8], line_no: usize, args: &[u8], store: &mut VarStore) {
         b"stdio" => {
             stdio();
         }
+        b"pipe" => {
+            pipe_demo(rest);
+        }
+        b"redir" => {
+            redir_demo(rest);
+        }
+        b"spawnredir" => {
+            spawn_redir(rest);
+        }
+        b"spawnstdin" => {
+            spawn_stdin(rest);
+        }
+        b"spawnio" => {
+            spawn_io(rest);
+        }
+        b"spawnioe" => {
+            spawn_io_err(rest);
+        }
         b"rm" => {
             unlink(rest);
         }
         b"rename" => {
             let (old_path, new_path) = split_word(rest);
             rename(old_path, new_path);
+        }
+        b"pwd" => {
+            pwd();
+        }
+        b"cd" => {
+            chdir(rest);
+        }
+        b"errno" => {
+            errno();
         }
         _ => {
             rt::print("rysh: unknown command at line ");
@@ -210,6 +244,32 @@ fn run_line(line: &[u8], line_no: usize, args: &[u8], store: &mut VarStore) {
             rt::write(b"\n");
         }
     }
+}
+
+fn pwd() {
+    let mut buffer = [0u8; 64];
+    let Some(cwd) = rt::cwd(&mut buffer) else {
+        rt::print("rysh: pwd failed\n");
+        return;
+    };
+    rt::write(cwd);
+    rt::write(b"\n");
+}
+
+fn chdir(path: &[u8]) {
+    if !rt::chdir(path) {
+        rt::print("rysh: cd failed: ");
+        rt::write(path);
+        rt::print(" errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+    }
+}
+
+fn errno() {
+    rt::print("errno ");
+    print_i32(rt::last_error());
+    rt::write(b"\n");
 }
 
 fn unlink(path: &[u8]) {
@@ -241,6 +301,338 @@ fn stdio() {
     let _ = rt::fd_write(rt::STDERR, b"stderr fd2 ok\n");
 }
 
+fn pipe_demo(message: &[u8]) {
+    let payload = if message.is_empty() {
+        b"pipe-ok".as_slice()
+    } else {
+        message
+    };
+    let Some((read_fd, write_fd)) = rt::pipe() else {
+        rt::print("rysh: pipe failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        return;
+    };
+    let _ = rt::fd_write(write_fd, payload);
+    let mut buffer = [0u8; 128];
+    let Some(data) = rt::fd_read(read_fd, &mut buffer) else {
+        rt::print("rysh: pipe read failed\n");
+        let _ = rt::close_fd(read_fd);
+        let _ = rt::close_fd(write_fd);
+        return;
+    };
+    rt::print("pipe ");
+    rt::write(data);
+    rt::write(b"\n");
+    let _ = rt::close_fd(read_fd);
+    let _ = rt::close_fd(write_fd);
+}
+
+fn redir_demo(message: &[u8]) {
+    let payload = if message.is_empty() {
+        b"redirect-ok".as_slice()
+    } else {
+        message
+    };
+    let Some((read_fd, write_fd)) = rt::pipe() else {
+        rt::print("rysh: redir pipe failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        return;
+    };
+    if !rt::dup2(write_fd, rt::STDOUT) {
+        rt::print("rysh: dup2 failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        let _ = rt::close_fd(read_fd);
+        let _ = rt::close_fd(write_fd);
+        return;
+    }
+    let _ = rt::fd_write(rt::STDOUT, payload);
+    let _ = rt::dup2(rt::STDOUT, rt::STDOUT);
+    let mut buffer = [0u8; 128];
+    let Some(data) = rt::fd_read(read_fd, &mut buffer) else {
+        rt::print("rysh: redir read failed\n");
+        let _ = rt::close_fd(read_fd);
+        let _ = rt::close_fd(write_fd);
+        return;
+    };
+    rt::print("redir ");
+    rt::write(data);
+    rt::write(b"\n");
+    let _ = rt::close_fd(read_fd);
+    let _ = rt::close_fd(write_fd);
+}
+
+fn spawn_redir(rest: &[u8]) {
+    let (name, args) = split_word(rest);
+    let program = if name.is_empty() {
+        b"hello".as_slice()
+    } else {
+        name
+    };
+    let Some((read_fd, write_fd)) = rt::pipe() else {
+        rt::print("rysh: spawnredir pipe failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        return;
+    };
+    if !rt::dup2(write_fd, rt::STDOUT) {
+        rt::print("rysh: spawnredir dup2 failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        let _ = rt::close_fd(read_fd);
+        let _ = rt::close_fd(write_fd);
+        return;
+    }
+    let spawn_result = rt::spawn(program, args);
+    let _ = rt::dup2(rt::STDOUT, rt::STDOUT);
+    match spawn_result {
+        Ok(pid) => {
+            rt::print("spawnredir pid ");
+            rt::print_usize(pid as usize);
+            rt::write(b"\n");
+        }
+        Err(code) => {
+            rt::print("rysh: spawnredir failed ");
+            print_i32(code);
+            rt::write(b"\n");
+        }
+    }
+
+    let mut buffer = [0u8; 512];
+    let Some(data) = rt::fd_read(read_fd, &mut buffer) else {
+        rt::print("rysh: spawnredir read failed\n");
+        let _ = rt::close_fd(read_fd);
+        let _ = rt::close_fd(write_fd);
+        return;
+    };
+    rt::print("spawnredir captured ");
+    rt::print_usize(data.len());
+    rt::write(b" B\n");
+    rt::write(data);
+    let _ = rt::close_fd(read_fd);
+    let _ = rt::close_fd(write_fd);
+}
+
+fn spawn_stdin(rest: &[u8]) {
+    let (name, payload) = split_word(rest);
+    let program = if name.is_empty() {
+        b"echoin".as_slice()
+    } else {
+        name
+    };
+    let input = if payload.is_empty() {
+        b"hello-on-stdin".as_slice()
+    } else {
+        payload
+    };
+    let Some((read_fd, write_fd)) = rt::pipe() else {
+        rt::print("rysh: spawnstdin pipe failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        return;
+    };
+    let _ = rt::fd_write(write_fd, input);
+    if !rt::dup2(read_fd, rt::STDIN) {
+        rt::print("rysh: spawnstdin dup2 failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        let _ = rt::close_fd(read_fd);
+        let _ = rt::close_fd(write_fd);
+        return;
+    }
+    match rt::spawn(program, b"") {
+        Ok(pid) => {
+            rt::print("spawnstdin pid ");
+            rt::print_usize(pid as usize);
+            rt::write(b"\n");
+        }
+        Err(code) => {
+            rt::print("rysh: spawnstdin failed ");
+            print_i32(code);
+            rt::write(b"\n");
+        }
+    }
+    let _ = rt::dup2(rt::STDIN, rt::STDIN);
+    let _ = rt::close_fd(read_fd);
+    let _ = rt::close_fd(write_fd);
+}
+
+fn spawn_io(rest: &[u8]) {
+    let (name, payload) = split_word(rest);
+    let program = if name.is_empty() {
+        b"echoin".as_slice()
+    } else {
+        name
+    };
+    let input = if payload.is_empty() {
+        b"hello-spawnio".as_slice()
+    } else {
+        payload
+    };
+    let Some((stdin_read, stdin_write)) = rt::pipe() else {
+        rt::print("rysh: spawnio stdin pipe failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        return;
+    };
+    let Some((stdout_read, stdout_write)) = rt::pipe() else {
+        rt::print("rysh: spawnio stdout pipe failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        let _ = rt::close_fd(stdin_read);
+        let _ = rt::close_fd(stdin_write);
+        return;
+    };
+    let _ = rt::fd_write(stdin_write, input);
+    if !rt::dup2(stdin_read, rt::STDIN) || !rt::dup2(stdout_write, rt::STDOUT) {
+        rt::print("rysh: spawnio dup2 failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        let _ = rt::dup2(rt::STDIN, rt::STDIN);
+        let _ = rt::dup2(rt::STDOUT, rt::STDOUT);
+        let _ = rt::close_fd(stdin_read);
+        let _ = rt::close_fd(stdin_write);
+        let _ = rt::close_fd(stdout_read);
+        let _ = rt::close_fd(stdout_write);
+        return;
+    }
+    let spawn_result = rt::spawn(program, b"");
+    let _ = rt::dup2(rt::STDIN, rt::STDIN);
+    let _ = rt::dup2(rt::STDOUT, rt::STDOUT);
+    match spawn_result {
+        Ok(pid) => {
+            rt::print("spawnio pid ");
+            rt::print_usize(pid as usize);
+            rt::write(b"\n");
+        }
+        Err(code) => {
+            rt::print("rysh: spawnio failed ");
+            print_i32(code);
+            rt::write(b"\n");
+        }
+    }
+
+    let mut buffer = [0u8; 256];
+    let Some(data) = rt::fd_read(stdout_read, &mut buffer) else {
+        rt::print("rysh: spawnio read failed\n");
+        let _ = rt::close_fd(stdin_read);
+        let _ = rt::close_fd(stdin_write);
+        let _ = rt::close_fd(stdout_read);
+        let _ = rt::close_fd(stdout_write);
+        return;
+    };
+    rt::print("spawnio captured ");
+    rt::print_usize(data.len());
+    rt::write(b" B\n");
+    rt::write(data);
+    let _ = rt::close_fd(stdin_read);
+    let _ = rt::close_fd(stdin_write);
+    let _ = rt::close_fd(stdout_read);
+    let _ = rt::close_fd(stdout_write);
+}
+
+fn spawn_io_err(rest: &[u8]) {
+    let (name, payload) = split_word(rest);
+    let program = if name.is_empty() {
+        b"echoin".as_slice()
+    } else {
+        name
+    };
+    let input = if payload.is_empty() {
+        b"hello-spawnioe".as_slice()
+    } else {
+        payload
+    };
+    let Some((stdin_read, stdin_write)) = rt::pipe() else {
+        rt::print("rysh: spawnioe stdin pipe failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        return;
+    };
+    let Some((stdout_read, stdout_write)) = rt::pipe() else {
+        rt::print("rysh: spawnioe stdout pipe failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        close4(stdin_read, stdin_write, -1, -1);
+        return;
+    };
+    let Some((stderr_read, stderr_write)) = rt::pipe() else {
+        rt::print("rysh: spawnioe stderr pipe failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        close4(stdin_read, stdin_write, stdout_read, stdout_write);
+        return;
+    };
+
+    let _ = rt::fd_write(stdin_write, input);
+    if !rt::dup2(stdin_read, rt::STDIN)
+        || !rt::dup2(stdout_write, rt::STDOUT)
+        || !rt::dup2(stderr_write, rt::STDERR)
+    {
+        rt::print("rysh: spawnioe dup2 failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+        reset_stdio();
+        close4(stdin_read, stdin_write, stdout_read, stdout_write);
+        close4(stderr_read, stderr_write, -1, -1);
+        return;
+    }
+
+    let spawn_result = rt::spawn(program, b"");
+    reset_stdio();
+    match spawn_result {
+        Ok(pid) => {
+            rt::print("spawnioe pid ");
+            rt::print_usize(pid as usize);
+            rt::write(b"\n");
+        }
+        Err(code) => {
+            rt::print("rysh: spawnioe failed ");
+            print_i32(code);
+            rt::write(b"\n");
+        }
+    }
+
+    let mut stdout_buffer = [0u8; 256];
+    let mut stderr_buffer = [0u8; 128];
+    let stdout_data = rt::fd_read(stdout_read, &mut stdout_buffer).unwrap_or(b"");
+    let stderr_data = rt::fd_read(stderr_read, &mut stderr_buffer).unwrap_or(b"");
+    rt::print("spawnioe stdout ");
+    rt::print_usize(stdout_data.len());
+    rt::write(b" B\n");
+    rt::write(stdout_data);
+    rt::print("spawnioe stderr ");
+    rt::print_usize(stderr_data.len());
+    rt::write(b" B\n");
+    rt::write(stderr_data);
+
+    close4(stdin_read, stdin_write, stdout_read, stdout_write);
+    close4(stderr_read, stderr_write, -1, -1);
+}
+
+fn reset_stdio() {
+    let _ = rt::dup2(rt::STDIN, rt::STDIN);
+    let _ = rt::dup2(rt::STDOUT, rt::STDOUT);
+    let _ = rt::dup2(rt::STDERR, rt::STDERR);
+}
+
+fn close4(a: i32, b: i32, c: i32, d: i32) {
+    if a >= 0 {
+        let _ = rt::close_fd(a);
+    }
+    if b >= 0 {
+        let _ = rt::close_fd(b);
+    }
+    if c >= 0 {
+        let _ = rt::close_fd(c);
+    }
+    if d >= 0 {
+        let _ = rt::close_fd(d);
+    }
+}
+
 fn spawn(name: &[u8], args: &[u8]) {
     match rt::spawn(name, args) {
         Ok(pid) => {
@@ -260,6 +652,14 @@ fn spawn(name: &[u8], args: &[u8]) {
 }
 
 fn wait_process(pid: &[u8]) {
+    if pid.is_empty() {
+        let Some((pid, status)) = rt::wait_any() else {
+            rt::print("rysh: wait failed: no child status\n");
+            return;
+        };
+        print_process_status(pid, status);
+        return;
+    }
     let Some(pid) = parse_u32(pid) else {
         rt::print("rysh: invalid pid\n");
         return;
@@ -270,6 +670,10 @@ fn wait_process(pid: &[u8]) {
         rt::write(b"\n");
         return;
     };
+    print_process_status(pid, status);
+}
+
+fn print_process_status(pid: u32, status: rt::ProcessStatus) {
     rt::print("pid ");
     rt::print_usize(pid as usize);
     rt::print(" ");
@@ -317,6 +721,31 @@ fn getenv(key: &[u8]) {
     rt::print("=");
     rt::write(value);
     rt::write(b"\n");
+}
+
+fn setenv(key: &[u8], value: &[u8]) {
+    if rt::env_set(key, value) {
+        rt::write(key);
+        rt::print("=");
+        rt::write(value);
+        rt::write(b"\n");
+    } else {
+        rt::print("rysh: setenv failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+    }
+}
+
+fn unsetenv(key: &[u8]) {
+    if rt::env_remove(key) {
+        rt::print("unset ");
+        rt::write(key);
+        rt::write(b"\n");
+    } else {
+        rt::print("rysh: unsetenv failed errno ");
+        print_i32(rt::last_error());
+        rt::write(b"\n");
+    }
 }
 
 fn fill_file(path: &[u8], count: &[u8]) {

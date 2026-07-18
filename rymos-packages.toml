@@ -26,3 +26,43 @@ bin = "allocdemo"
 source = "programs/allocdemo"
 install = "programs/allocdemo.elf"
 enabled = true
+
+[[program]]
+name = "echoin"
+package = "rymos-program-echoin"
+bin = "echoin"
+source = "programs/echoin"
+install = "programs/echoin.elf"
+enabled = true
+
+[[program]]
+name = "cmdapi"
+package = "rymos-program-cmdapi"
+bin = "cmdapi"
+source = "programs/cmdapi"
+install = "programs/cmdapi.elf"
+enabled = true
+
+[[program]]
+name = "fswalk"
+package = "rymos-program-fswalk"
+bin = "fswalk"
+source = "programs/fswalk"
+install = "programs/fswalk.elf"
+enabled = true
+
+[[program]]
+name = "heapstress"
+package = "rymos-program-heapstress"
+bin = "heapstress"
+source = "programs/heapstress"
+install = "programs/heapstress.elf"
+enabled = true
+
+[[program]]
+name = "stdshim"
+package = "rymos-program-stdshim"
+bin = "stdshim"
+source = "programs/stdshim"
+install = "programs/stdshim.elf"
+enabled = true

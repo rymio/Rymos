@@ -21,7 +21,12 @@ const EFI_RUNTIME_SERVICES_DATA: usize = 6;
 const ELF_MAGIC: &[u8; 4] = b"\x7FELF";
 const PT_LOAD: u32 = 1;
 const KERNEL_READ_LIMIT: usize = 1024 * 1024;
-const INITRD_READ_LIMIT: usize = 128 * 1024;
+// UEFI's File.Read() silently reads at most this many bytes with no error if
+// the file is larger -- there is no size check before the read, so this must
+// stay ahead of INITRD.RFS's real size or bootfs entries get silently
+// truncated away. Real (unstripped, debug) `std` binaries are much larger
+// than `no_std` ones (single digit MiB each), so this has real headroom.
+const INITRD_READ_LIMIT: usize = 32 * 1024 * 1024;
 const KERNEL_PATH: [Char16; 12] = [
     '\\' as Char16,
     'K' as Char16,

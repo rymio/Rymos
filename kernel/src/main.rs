@@ -23,11 +23,19 @@ const FILE_DATA_MAX: usize = 192;
 const PROCESS_COUNT: usize = 16;
 const PROCESS_NAME_MAX: usize = 24;
 const PROCESS_ARGS_MAX: usize = 64;
+const PROCESS_ARGV_COUNT_MAX: usize = 8;
+const PROCESS_ARGV_VALUE_MAX: usize = 64;
 const PROCESS_HEAP_PAGE_MAX: usize = 1024;
+const PROCESS_MAPPING_MAX: usize = 64;
 const APP_CWD_MAX: usize = 64;
 const ENV_COUNT: usize = 6;
-const APP_FD_COUNT: usize = 4;
+const APP_ENV_COUNT: usize = 8;
+const APP_ENV_KEY_MAX: usize = 24;
+const APP_ENV_VALUE_MAX: usize = 96;
+const APP_FD_COUNT: usize = 32;
 const APP_FD_BASE: i32 = 3;
+const APP_PIPE_COUNT: usize = 4;
+const APP_PIPE_BUFFER_SIZE: usize = 1024;
 const STDIN_FD: i32 = 0;
 const STDOUT_FD: i32 = 1;
 const STDERR_FD: i32 = 2;
@@ -35,6 +43,8 @@ const FD_READ: u32 = 1;
 const FD_WRITE: u32 = 2;
 const FD_CREATE: u32 = 4;
 const FD_TRUNCATE: u32 = 8;
+const FD_APPEND: u32 = 16;
+const FD_CREATE_NEW: u32 = 32;
 const STAT_KIND_FILE: u32 = 1;
 const STAT_KIND_DIR: u32 = 2;
 const STAT_FS_BOOTFS: u32 = 1;
@@ -49,11 +59,42 @@ const ERR_EXIST: i32 = 17;
 const ERR_IO: i32 = 5;
 const PFS_KIND_FILE: u8 = 1;
 const PFS_KIND_DIR: u8 = 2;
-const PFS_HEADER_SECTORS: u32 = 8;
+// Entry layout (RYMFS5): kind(1) name_len(1) size(4) extent_count(1)
+// extents[PFS_MAX_EXTENTS](8 each: start_sector u32 + sector_count u32)
+// created_ticks(8) modified_ticks(8) mode(1) name(PFS_NAME_MAX). Files no
+// longer need one giant contiguous run -- allocation can spread across up
+// to PFS_MAX_EXTENTS separate runs, so free space fragmented by other files
+// doesn't cause spurious "disk full" errors.
+const PFS_MAX_EXTENTS: usize = 4;
+const PFS_EXTENT_ENTRY_SIZE: usize = 8;
+const PFS_EXTENT_COUNT_OFFSET: usize = 6;
+const PFS_EXTENTS_OFFSET: usize = 7;
+const PFS_EXTENTS_BYTES: usize = PFS_MAX_EXTENTS * PFS_EXTENT_ENTRY_SIZE;
+const PFS_CREATED_OFFSET: usize = PFS_EXTENTS_OFFSET + PFS_EXTENTS_BYTES;
+const PFS_MODIFIED_OFFSET: usize = PFS_CREATED_OFFSET + 8;
+const PFS_MODE_OFFSET: usize = PFS_MODIFIED_OFFSET + 8;
+const PFS_NAME_OFFSET: usize = PFS_MODE_OFFSET + 1;
+// Raised from the original RYMFS3/4 values (30, 102) for longer nested paths
+// and a bigger directory. Both are still a fixed compile-time ceiling, not
+// true unbounded growth (that would mean moving the entry table itself onto
+// growable disk extents, a bigger future redesign) -- but the on-disk header
+// is read into a stack-local buffer in a few places (`read_header_silent`,
+// `format`), so this can't grow arbitrarily without also moving that buffer
+// off the stack. Verified this size boots and runs cleanly in QEMU.
+const PFS_NAME_MAX: usize = 96;
+const PFS_ENTRY_SIZE: usize = PFS_NAME_OFFSET + PFS_NAME_MAX;
+const PFS_HEADER_SECTORS: u32 = {
+    let bytes = 16 + PFS_ENTRY_COUNT * PFS_ENTRY_SIZE;
+    ((bytes + 511) / 512) as u32
+};
 const PFS_HEADER_BYTES: usize = PFS_HEADER_SECTORS as usize * 512;
-const PFS_ENTRY_COUNT: usize = 96;
-const PFS_ENTRY_SIZE: usize = 40;
-const PFS_NAME_MAX: usize = 30;
+const PFS_ENTRY_COUNT: usize = 256;
+const PFS_MODE_READ: u8 = 0b001;
+const PFS_MODE_WRITE: u8 = 0b010;
+const PFS_MODE_EXEC: u8 = 0b100;
+const PFS_MODE_DEFAULT_FILE: u8 = PFS_MODE_READ | PFS_MODE_WRITE;
+const PFS_MODE_DEFAULT_DIR: u8 = PFS_MODE_READ | PFS_MODE_WRITE | PFS_MODE_EXEC;
+const BOOTFS_MODE: u32 = (PFS_MODE_READ | PFS_MODE_EXEC) as u32;
 const PFS_SECTORS_PER_FILE: u32 = 524288;
 const PFS_FILE_MAX: usize = PFS_SECTORS_PER_FILE as usize * 512;
 const PFS_DATA_START: u32 = PFS_HEADER_SECTORS;
@@ -77,6 +118,11 @@ const KERNEL_SCRATCH_BASE: u64 = 0xFFFF_8000_0000_0000;
 const USER_HEAP_BASE: u64 = 0xFFFF_9000_0000_0000;
 const USER_HEAP_STRIDE: u64 = 256 * 1024 * 1024;
 const USER_HEAP_MAX_PAGES_PER_CALL: usize = 4096;
+const USER_MMAP_BASE: u64 = 0xFFFF_A000_0000_0000;
+const USER_MMAP_STRIDE: u64 = 1024 * 1024 * 1024;
+const USER_MMAP_SIZE: u64 = 768 * 1024 * 1024;
+const USER_MMAP_MAX_PAGES_PER_CALL: usize = 16384;
+const MEM_MAP_GUARD: u32 = 1;
 const APP_LOAD_MIN: u64 = 0x200000;
 const APP_LOAD_MAX: u64 = 0x9000000;
 const ELF_MAGIC: &[u8; 4] = b"\x7FELF";
@@ -125,15 +171,25 @@ struct RymosAbi {
     mkdir: extern "sysv64" fn(*const u8, usize) -> i32,
     env_get: extern "sysv64" fn(*const u8, usize, *mut u8, usize) -> isize,
     env_list: extern "sysv64" fn(usize, *mut u8, usize, *mut u8, usize) -> isize,
+    env_set: extern "sysv64" fn(*const u8, usize, *const u8, usize) -> i32,
+    env_remove: extern "sysv64" fn(*const u8, usize) -> i32,
     spawn: extern "sysv64" fn(*const u8, usize, *const u8, usize) -> i32,
+    spawn_argv: extern "sysv64" fn(*const u8, usize, *const ArgSlice, usize) -> i32,
     wait: extern "sysv64" fn(u32, *mut RymosProcessStatus) -> i32,
+    wait_any: extern "sysv64" fn(*mut RymosProcessStatus) -> i32,
     mem_alloc_pages: extern "sysv64" fn(usize) -> u64,
+    mem_map_pages: extern "sysv64" fn(usize, u32) -> u64,
+    mem_unmap_pages: extern "sysv64" fn(u64, usize) -> i32,
     time_ticks: extern "sysv64" fn() -> u64,
     unlink: extern "sysv64" fn(*const u8, usize) -> i32,
     rename: extern "sysv64" fn(*const u8, usize, *const u8, usize) -> i32,
     cwd: extern "sysv64" fn(*mut u8, usize) -> isize,
     chdir: extern "sysv64" fn(*const u8, usize) -> i32,
     last_error: extern "sysv64" fn() -> i32,
+    pipe: extern "sysv64" fn(*mut i32, *mut i32) -> i32,
+    dup2: extern "sysv64" fn(i32, i32) -> i32,
+    argv_count: extern "sysv64" fn() -> usize,
+    argv_get: extern "sysv64" fn(usize, *mut u8, usize) -> isize,
 }
 
 #[repr(C)]
@@ -142,6 +198,9 @@ struct RymosStat {
     kind: u32,
     fs: u32,
     size: usize,
+    created_ticks: u64,
+    modified_ticks: u64,
+    mode: u32,
 }
 
 #[repr(C)]
@@ -149,6 +208,22 @@ struct RymosStat {
 struct RymosProcessStatus {
     state: u32,
     exit_code: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ArgSlice {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl ArgSlice {
+    const fn empty() -> Self {
+        Self {
+            ptr: core::ptr::null(),
+            len: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -209,15 +284,44 @@ enum ProcessState {
 #[derive(Clone, Copy)]
 struct Process {
     pid: u32,
+    parent_pid: u32,
+    waited: bool,
     state: ProcessState,
     exit_code: i32,
     name: [u8; PROCESS_NAME_MAX],
     name_len: usize,
     args: [u8; PROCESS_ARGS_MAX],
     args_len: usize,
+    argv: [[u8; PROCESS_ARGV_VALUE_MAX]; PROCESS_ARGV_COUNT_MAX],
+    argv_lens: [usize; PROCESS_ARGV_COUNT_MAX],
+    argv_count: usize,
     heap_base: u64,
     heap_pages: [u64; PROCESS_HEAP_PAGE_MAX],
     heap_page_count: usize,
+    mappings: [ProcessMapping; PROCESS_MAPPING_MAX],
+    /// Physical address of this process's private PML4, or 0 if it hasn't
+    /// been given an isolated address space (falls back to the shared
+    /// kernel PML4). See `create_process_address_space`.
+    pml4_phys: u64,
+    /// The parent's std-fd/cwd/env redirection state captured at `spawn()`
+    /// time (not run time). `spawn()` only enqueues a child now (see
+    /// `spawn_prepared`/`run_ready_task`) instead of running it inline, but
+    /// `Command`-style helpers still redirect stdio/cwd/env on the *shared*
+    /// ambient globals, spawn, and immediately revert that redirection
+    /// before ever waiting -- so by the time the child actually runs it must
+    /// see the redirection as it was at spawn time, not whatever the caller
+    /// (or anything it does afterward) has left the globals as since.
+    inherited_std_fds: [i32; 3],
+    inherited_cwd: [u8; APP_CWD_MAX],
+    inherited_cwd_len: usize,
+    inherited_env: [AppEnvVar; APP_ENV_COUNT],
+}
+
+#[derive(Clone, Copy)]
+struct ProcessMapping {
+    used: bool,
+    virt: u64,
+    pages: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -231,11 +335,55 @@ struct AppFd {
     pfs_index: usize,
 }
 
+#[derive(Clone, Copy)]
+struct AppPipe {
+    used: bool,
+    read_open: bool,
+    write_open: bool,
+    buffer: [u8; APP_PIPE_BUFFER_SIZE],
+    read_offset: usize,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct AppEnvVar {
+    used: bool,
+    deleted: bool,
+    key: [u8; APP_ENV_KEY_MAX],
+    key_len: usize,
+    value: [u8; APP_ENV_VALUE_MAX],
+    value_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct AppStateSnapshot {
+    console: *mut Console,
+    bootfs: BootFs,
+    args_ptr: *const u8,
+    args_len: usize,
+    pid: u32,
+    process_index: usize,
+    fds: [AppFd; APP_FD_COUNT],
+    pipes: [AppPipe; APP_PIPE_COUNT],
+    std_fds: [i32; 3],
+    cwd: [u8; APP_CWD_MAX],
+    cwd_len: usize,
+    env: [AppEnvVar; APP_ENV_COUNT],
+    last_error: i32,
+    heap_base: u64,
+    heap_next: u64,
+    heap_limit: u64,
+    mmap_next: u64,
+    mmap_limit: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppFdKind {
     Empty,
     BootFs,
     Pfs,
+    PipeRead,
+    PipeWrite,
 }
 
 impl AppFd {
@@ -252,19 +400,66 @@ impl AppFd {
     }
 }
 
+impl AppPipe {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            read_open: false,
+            write_open: false,
+            buffer: [0; APP_PIPE_BUFFER_SIZE],
+            read_offset: 0,
+            len: 0,
+        }
+    }
+}
+
+impl AppEnvVar {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            deleted: false,
+            key: [0; APP_ENV_KEY_MAX],
+            key_len: 0,
+            value: [0; APP_ENV_VALUE_MAX],
+            value_len: 0,
+        }
+    }
+}
+
 impl Process {
     const fn empty() -> Self {
         Self {
             pid: 0,
+            parent_pid: 0,
+            waited: false,
             state: ProcessState::Empty,
             exit_code: 0,
             name: [0; PROCESS_NAME_MAX],
             name_len: 0,
             args: [0; PROCESS_ARGS_MAX],
             args_len: 0,
+            argv: [[0; PROCESS_ARGV_VALUE_MAX]; PROCESS_ARGV_COUNT_MAX],
+            argv_lens: [0; PROCESS_ARGV_COUNT_MAX],
+            argv_count: 0,
             heap_base: 0,
             heap_pages: [0; PROCESS_HEAP_PAGE_MAX],
             heap_page_count: 0,
+            mappings: [ProcessMapping::empty(); PROCESS_MAPPING_MAX],
+            pml4_phys: 0,
+            inherited_std_fds: [STDIN_FD, STDOUT_FD, STDERR_FD],
+            inherited_cwd: [0; APP_CWD_MAX],
+            inherited_cwd_len: 0,
+            inherited_env: [AppEnvVar::empty(); APP_ENV_COUNT],
+        }
+    }
+}
+
+impl ProcessMapping {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            virt: 0,
+            pages: 0,
         }
     }
 }
@@ -344,8 +539,11 @@ static mut APP_ARGS_LEN: usize = 0;
 static mut APP_PID: u32 = 0;
 static mut APP_PROCESS_INDEX: usize = PROCESS_COUNT;
 static mut APP_FDS: [AppFd; APP_FD_COUNT] = [AppFd::empty(); APP_FD_COUNT];
+static mut APP_PIPES: [AppPipe; APP_PIPE_COUNT] = [AppPipe::empty(); APP_PIPE_COUNT];
+static mut APP_STD_FDS: [i32; 3] = [STDIN_FD, STDOUT_FD, STDERR_FD];
 static mut APP_CWD: [u8; APP_CWD_MAX] = [0; APP_CWD_MAX];
 static mut APP_CWD_LEN: usize = 0;
+static mut APP_ENV: [AppEnvVar; APP_ENV_COUNT] = [AppEnvVar::empty(); APP_ENV_COUNT];
 static mut APP_LAST_ERROR: i32 = ERR_OK;
 static mut PROCESS_TABLE: [Process; PROCESS_COUNT] = [Process::empty(); PROCESS_COUNT];
 static mut NEXT_PID: u32 = 1;
@@ -356,6 +554,8 @@ static mut NEXT_SCRATCH_VIRT: u64 = KERNEL_SCRATCH_BASE;
 static mut APP_HEAP_BASE: u64 = 0;
 static mut APP_HEAP_NEXT: u64 = 0;
 static mut APP_HEAP_LIMIT: u64 = 0;
+static mut APP_MMAP_NEXT: u64 = 0;
+static mut APP_MMAP_LIMIT: u64 = 0;
 static ENV: [(&[u8], &[u8]); ENV_COUNT] = [
     (b"PATH", b"programs"),
     (b"HOME", b"/"),
@@ -365,7 +565,7 @@ static ENV: [(&[u8], &[u8]); ENV_COUNT] = [
     (b"TMPDIR", b"pfs:tmp"),
 ];
 static RYMOS_ABI: RymosAbi = RymosAbi {
-    version: 11,
+    version: 21,
     write: abi_write,
     pid: abi_pid,
     args: abi_args,
@@ -382,15 +582,25 @@ static RYMOS_ABI: RymosAbi = RymosAbi {
     mkdir: abi_mkdir,
     env_get: abi_env_get,
     env_list: abi_env_list,
+    env_set: abi_env_set,
+    env_remove: abi_env_remove,
     spawn: abi_spawn,
+    spawn_argv: abi_spawn_argv,
     wait: abi_wait,
+    wait_any: abi_wait_any,
     mem_alloc_pages: abi_mem_alloc_pages,
+    mem_map_pages: abi_mem_map_pages,
+    mem_unmap_pages: abi_mem_unmap_pages,
     time_ticks: abi_time_ticks,
     unlink: abi_unlink,
     rename: abi_rename,
     cwd: abi_cwd,
     chdir: abi_chdir,
     last_error: abi_last_error,
+    pipe: abi_pipe,
+    dup2: abi_dup2,
+    argv_count: abi_argv_count,
+    argv_get: abi_argv_get,
 };
 
 #[unsafe(no_mangle)]
@@ -979,6 +1189,18 @@ struct RamFs {
     entries: [FileEntry; FILE_COUNT],
 }
 
+#[derive(Clone, Copy)]
+struct PfsExtent {
+    start: u32,
+    sectors: u32,
+}
+
+impl PfsExtent {
+    const fn empty() -> Self {
+        Self { start: 0, sectors: 0 }
+    }
+}
+
 struct PersistentFs;
 
 impl PersistentFs {
@@ -989,8 +1211,8 @@ impl PersistentFs {
         }
 
         let mut header = [0u8; PFS_HEADER_BYTES];
-        header[0..8].copy_from_slice(b"RYMFS3\0\0");
-        header[8] = 3;
+        header[0..8].copy_from_slice(b"RYMFS5\0\0");
+        header[8] = 5;
         header[9] = PFS_ENTRY_COUNT as u8;
 
         if Self::write_header(&header) {
@@ -1041,13 +1263,16 @@ impl PersistentFs {
 
         let size = pfs_entry_size(&header, index);
         let mut remaining = size;
-        let start_sector = pfs_entry_start(&header, index);
-        for sector_index in 0..sectors_for_len(size) {
+        for logical_sector in 0..sectors_for_len(size) {
             if remaining == 0 {
                 break;
             }
+            let Some(lba) = pfs_entry_lba_for_sector(&header, index, logical_sector) else {
+                console.write_line("pread: corrupt extents");
+                return;
+            };
             let mut sector = [0u8; 512];
-            if !ata_read_sector(ATA_DATA_DRIVE, start_sector + sector_index, &mut sector) {
+            if !ata_read_sector(ATA_DATA_DRIVE, lba, &mut sector) {
                 console.write_line("pread: disk read failed");
                 return;
             }
@@ -1090,38 +1315,31 @@ impl PersistentFs {
             },
         };
 
-        let sectors = sectors_for_len(data.len());
-        let start_sector = if sectors == 0 {
-            0
-        } else {
-            let Some(start_sector) = pfs_alloc_extent(&header, sectors, Some(index)) else {
-                console.write_line("pwrite: disk full");
-                return;
-            };
-            start_sector
-        };
-        for sector_index in 0..sectors {
-            let mut sector = [0u8; 512];
-            let start = sector_index as usize * 512;
-            if start < data.len() {
-                let end = min(start + 512, data.len());
-                sector[..end - start].copy_from_slice(&data[start..end]);
-            }
-            if !ata_write_sector(ATA_DATA_DRIVE, start_sector + sector_index, &sector) {
-                console.write_line("pwrite: disk write failed");
+        // Ensure the entry exists (possibly empty) before delegating to the
+        // generic write path, which handles allocation (possibly across
+        // several extents) and capacity growth uniformly with the ABI path.
+        if !pfs_entry_used(&header, index) {
+            pfs_set_entry(
+                &mut header,
+                index,
+                name,
+                0,
+                PFS_KIND_FILE,
+                &[],
+                read_tsc(),
+                PFS_MODE_DEFAULT_FILE,
+            );
+            if !Self::write_header(&header) {
+                console.write_line("pwrite: header write failed");
                 return;
             }
         }
 
-        pfs_set_entry(
-            &mut header,
-            index,
-            name,
-            data.len(),
-            PFS_KIND_FILE,
-            start_sector,
-        );
-        if Self::write_header(&header) {
+        if !pfs_write_at(index, 0, data) {
+            console.write_line("pwrite: disk full");
+            return;
+        }
+        if pfs_update_size(index, data.len()) {
             console.write_line("ok");
         } else {
             console.write_line("pwrite: header write failed");
@@ -1148,7 +1366,16 @@ impl PersistentFs {
             console.write_line("pmkdir: filesystem full");
             return;
         };
-        pfs_set_entry(&mut header, index, name, 0, PFS_KIND_DIR, 0);
+        pfs_set_entry(
+            &mut header,
+            index,
+            name,
+            0,
+            PFS_KIND_DIR,
+            &[],
+            read_tsc(),
+            PFS_MODE_DEFAULT_DIR,
+        );
         if Self::write_header(&header) {
             console.write_line("ok");
         } else {
@@ -1223,7 +1450,7 @@ impl PersistentFs {
                 return None;
             }
         }
-        if &header[0..8] != b"RYMFS3\0\0" {
+        if &header[0..8] != b"RYMFS5\0\0" {
             return None;
         }
         Some(header)
@@ -1249,23 +1476,18 @@ fn pfs_read_at(index: usize, offset: usize, dest: *mut u8, len: usize) -> bool {
     if offset + len > PFS_FILE_MAX || !pfs_entry_used(&header, index) {
         return false;
     }
-    let start_sector = pfs_entry_start(&header, index);
-    if start_sector == 0 && len != 0 {
-        return false;
-    }
 
     let mut copied = 0usize;
     while copied < len {
         let absolute = offset + copied;
-        let sector_index = absolute / 512;
+        let logical_sector = (absolute / 512) as u32;
         let sector_offset = absolute % 512;
         let count = min(len - copied, 512 - sector_offset);
+        let Some(lba) = pfs_entry_lba_for_sector(&header, index, logical_sector) else {
+            return false;
+        };
         let mut sector = [0u8; 512];
-        if !ata_read_sector(
-            ATA_DATA_DRIVE,
-            start_sector + sector_index as u32,
-            &mut sector,
-        ) {
+        if !ata_read_sector(ATA_DATA_DRIVE, lba, &mut sector) {
             return false;
         }
         unsafe {
@@ -1281,21 +1503,39 @@ fn pfs_write_at(index: usize, offset: usize, data: &[u8]) -> bool {
     if new_size > PFS_FILE_MAX {
         return false;
     }
+
+    let Some(old_size) = (match PersistentFs::read_header_silent() {
+        Some(header) if pfs_entry_used(&header, index) => Some(pfs_entry_size(&header, index)),
+        _ => None,
+    }) else {
+        return false;
+    };
+
     if !pfs_ensure_file_capacity(index, new_size) {
         return false;
     }
     let Some(header) = PersistentFs::read_header_silent() else {
         return false;
     };
-    let start_sector = pfs_entry_start(&header, index);
+
+    // Sparse write: a seek-past-EOF-then-write leaves a gap that nobody
+    // ever wrote. Freshly allocated sectors aren't implicitly zeroed (they're
+    // just whatever a first-fit scan over other entries' extents found
+    // free), so without this the gap would read back as leftover data from
+    // whatever previously occupied those sectors instead of zero.
+    if offset > old_size && !pfs_zero_range(&header, index, old_size, offset - old_size) {
+        return false;
+    }
 
     let mut copied = 0usize;
     while copied < data.len() {
         let absolute = offset + copied;
-        let sector_index = absolute / 512;
+        let logical_sector = (absolute / 512) as u32;
         let sector_offset = absolute % 512;
         let count = min(data.len() - copied, 512 - sector_offset);
-        let lba = start_sector + sector_index as u32;
+        let Some(lba) = pfs_entry_lba_for_sector(&header, index, logical_sector) else {
+            return false;
+        };
         let mut sector = [0u8; 512];
         if !ata_read_sector(ATA_DATA_DRIVE, lba, &mut sector) {
             return false;
@@ -1309,6 +1549,40 @@ fn pfs_write_at(index: usize, offset: usize, data: &[u8]) -> bool {
     true
 }
 
+/// Zeros the logical byte range `[start, start + len)` of an entry's data,
+/// used to make sparse writes (seek past EOF, then write) read back as
+/// zero instead of stale disk contents. Skips the read for whole sectors
+/// (only partial sectors at the range's edges need read-modify-write).
+fn pfs_zero_range(header: &[u8; PFS_HEADER_BYTES], index: usize, start: usize, len: usize) -> bool {
+    let mut written = 0usize;
+    while written < len {
+        let absolute = start + written;
+        let logical_sector = (absolute / 512) as u32;
+        let sector_offset = absolute % 512;
+        let count = min(len - written, 512 - sector_offset);
+        let Some(lba) = pfs_entry_lba_for_sector(header, index, logical_sector) else {
+            return false;
+        };
+        if count == 512 {
+            let sector = [0u8; 512];
+            if !ata_write_sector(ATA_DATA_DRIVE, lba, &sector) {
+                return false;
+            }
+        } else {
+            let mut sector = [0u8; 512];
+            if !ata_read_sector(ATA_DATA_DRIVE, lba, &mut sector) {
+                return false;
+            }
+            sector[sector_offset..sector_offset + count].fill(0);
+            if !ata_write_sector(ATA_DATA_DRIVE, lba, &sector) {
+                return false;
+            }
+        }
+        written += count;
+    }
+    true
+}
+
 fn pfs_update_size(index: usize, size: usize) -> bool {
     let Some(mut header) = PersistentFs::read_header_silent() else {
         return false;
@@ -1318,9 +1592,60 @@ fn pfs_update_size(index: usize, size: usize) -> bool {
     }
     let offset = pfs_entry_offset(index);
     header[offset + 2..offset + 6].copy_from_slice(&(size as u32).to_le_bytes());
+    pfs_touch_modified(&mut header, index);
     PersistentFs::write_header(&header)
 }
 
+/// Grows `extents[..*count]` by `additional_sectors`, searching for free
+/// space starting right after the current last extent (or from
+/// `PFS_DATA_START` if there isn't one yet). Critically, if the free run
+/// found continues immediately where the last extent left off, it *extends
+/// that extent in place* instead of consuming a new slot -- without this,
+/// incremental growth (e.g. many small sequential writes, each crossing a
+/// sector boundary) would burn through all `PFS_MAX_EXTENTS` slots on
+/// nothing but physically-contiguous sectors within a handful of writes,
+/// long before the file is actually fragmented against other files.
+fn pfs_grow_extents(
+    header: &[u8; PFS_HEADER_BYTES],
+    extents: &mut [PfsExtent; PFS_MAX_EXTENTS],
+    count: &mut usize,
+    additional_sectors: u32,
+    skip_index: Option<usize>,
+) -> bool {
+    let mut remaining = additional_sectors;
+    let mut search_from = if *count > 0 {
+        let last = extents[*count - 1];
+        last.start + last.sectors
+    } else {
+        PFS_DATA_START
+    };
+
+    while remaining > 0 {
+        let Some((run_start, run_len)) = pfs_find_free_run(header, search_from, remaining, skip_index)
+        else {
+            return false;
+        };
+        if *count > 0 && run_start == extents[*count - 1].start + extents[*count - 1].sectors {
+            extents[*count - 1].sectors += run_len;
+        } else {
+            if *count >= PFS_MAX_EXTENTS {
+                return false;
+            }
+            extents[*count] = PfsExtent { start: run_start, sectors: run_len };
+            *count += 1;
+        }
+        remaining -= run_len;
+        search_from = run_start + run_len;
+    }
+    true
+}
+
+/// Grows an entry's allocation to cover at least `size` bytes. Unlike the
+/// old single-extent design, growing never needs to copy existing data to a
+/// new location: it just allocates additional sectors (coalescing into an
+/// existing extent where possible, see `pfs_grow_extents`) for the
+/// shortfall. Does not touch the entry's logical size field -- that's a
+/// separate concern (see `pfs_update_size`), same contract as before.
 fn pfs_ensure_file_capacity(index: usize, size: usize) -> bool {
     let Some(mut header) = PersistentFs::read_header_silent() else {
         return false;
@@ -1330,19 +1655,22 @@ fn pfs_ensure_file_capacity(index: usize, size: usize) -> bool {
     }
 
     let old_size = pfs_entry_size(&header, index);
-    let old_start = pfs_entry_start(&header, index);
-    let old_sectors = sectors_for_len(old_size);
+    let old_sectors = pfs_entry_total_sectors(&header, index);
     let new_sectors = sectors_for_len(size);
-    if new_sectors == 0 || (old_start != 0 && new_sectors <= old_sectors) {
+    if new_sectors <= old_sectors {
         return true;
     }
 
-    let Some(new_start) = pfs_alloc_extent(&header, new_sectors, Some(index)) else {
-        return false;
-    };
-    if old_start != 0 && old_sectors != 0 && !pfs_copy_extent(old_start, new_start, old_sectors) {
+    let mut extents = [PfsExtent::empty(); PFS_MAX_EXTENTS];
+    let mut total_extents = pfs_entry_extent_count(&header, index);
+    for slot in 0..total_extents {
+        extents[slot] = pfs_entry_extent(&header, index, slot);
+    }
+    let additional = new_sectors - old_sectors;
+    if !pfs_grow_extents(&header, &mut extents, &mut total_extents, additional, Some(index)) {
         return false;
     }
+
     let name = {
         let old_name = pfs_entry_name(&header, index);
         let mut name = [0u8; PFS_NAME_MAX];
@@ -1350,66 +1678,78 @@ fn pfs_ensure_file_capacity(index: usize, size: usize) -> bool {
         (name, old_name.len())
     };
     let kind = pfs_entry_kind(&header, index);
+    let created = pfs_entry_created(&header, index);
+    let mode = pfs_entry_mode(&header, index);
     pfs_set_entry(
         &mut header,
         index,
         &name.0[..name.1],
         old_size,
         kind,
-        new_start,
+        &extents[..total_extents],
+        created,
+        mode,
     );
     PersistentFs::write_header(&header)
 }
 
-fn pfs_copy_extent(old_start: u32, new_start: u32, sectors: u32) -> bool {
-    for sector_index in 0..sectors {
-        let mut sector = [0u8; 512];
-        if !ata_read_sector(ATA_DATA_DRIVE, old_start + sector_index, &mut sector) {
-            return false;
-        }
-        if !ata_write_sector(ATA_DATA_DRIVE, new_start + sector_index, &sector) {
-            return false;
-        }
-    }
-    true
-}
-
-fn pfs_alloc_extent(
+/// Finds the first free contiguous run at or after `start_from`, capped to
+/// at most `max_len` sectors (the caller may ask for less than the full
+/// remaining free run so it can split allocation across several calls).
+/// Scans every other entry's *entire extent list* for overlaps -- there's no
+/// separate free-space bitmap; free space is always derived from whatever
+/// the current entries say they're using, same philosophy as the original
+/// single-extent allocator, just generalized to multiple extents per entry.
+fn pfs_find_free_run(
     header: &[u8; PFS_HEADER_BYTES],
-    sectors: u32,
+    start_from: u32,
+    max_len: u32,
     skip_index: Option<usize>,
-) -> Option<u32> {
-    if sectors == 0 || sectors > PFS_SECTORS_PER_FILE {
-        return None;
-    }
-    let mut candidate = PFS_DATA_START;
-    while candidate.checked_add(sectors)? <= PFS_DISK_SECTORS {
-        let mut overlaps = false;
+) -> Option<(u32, u32)> {
+    let mut candidate = start_from;
+    loop {
+        if candidate >= PFS_DISK_SECTORS {
+            return None;
+        }
+        let mut next_obstacle: Option<u32> = None;
+        let mut blocked = false;
         for index in 0..PFS_ENTRY_COUNT {
-            if Some(index) == skip_index
-                || !pfs_entry_used(header, index)
-                || pfs_entry_is_dir(header, index)
-            {
+            if Some(index) == skip_index || !pfs_entry_used(header, index) || pfs_entry_is_dir(header, index) {
                 continue;
             }
-            let used_start = pfs_entry_start(header, index);
-            let used_sectors = sectors_for_len(pfs_entry_size(header, index));
-            if used_start == 0 || used_sectors == 0 {
-                continue;
+            let extent_count = pfs_entry_extent_count(header, index);
+            for slot in 0..extent_count {
+                let extent = pfs_entry_extent(header, index, slot);
+                if extent.sectors == 0 {
+                    continue;
+                }
+                let used_end = extent.start + extent.sectors;
+                if extent.start <= candidate && candidate < used_end {
+                    candidate = used_end;
+                    blocked = true;
+                    break;
+                }
+                if extent.start > candidate && next_obstacle.is_none_or(|current| extent.start < current) {
+                    next_obstacle = Some(extent.start);
+                }
             }
-            let used_end = used_start + used_sectors;
-            let candidate_end = candidate + sectors;
-            if candidate < used_end && used_start < candidate_end {
-                candidate = used_end;
-                overlaps = true;
+            if blocked {
                 break;
             }
         }
-        if !overlaps {
-            return Some(candidate);
+        if blocked {
+            continue;
         }
+        let end_bound = next_obstacle.unwrap_or(PFS_DISK_SECTORS).min(PFS_DISK_SECTORS);
+        if end_bound <= candidate {
+            return None;
+        }
+        let take = (end_bound - candidate).min(max_len);
+        if take == 0 {
+            return None;
+        }
+        return Some((candidate, take));
     }
-    None
 }
 
 fn sectors_for_len(len: usize) -> u32 {
@@ -1425,6 +1765,18 @@ fn pfs_entry_offset(index: usize) -> usize {
 }
 
 fn process_spawn(name: &[u8], args: &[u8]) -> Option<usize> {
+    let mut argv = [ArgSlice::empty(); PROCESS_ARGV_COUNT_MAX];
+    let argv_count = raw_args_to_argv(args, &mut argv);
+    let parent_pid = unsafe { APP_PID };
+    process_spawn_with_argv(name, args, &argv[..argv_count], parent_pid)
+}
+
+fn process_spawn_with_argv(
+    name: &[u8],
+    args: &[u8],
+    argv: &[ArgSlice],
+    parent_pid: u32,
+) -> Option<usize> {
     unsafe {
         let table = &raw mut PROCESS_TABLE;
         let pid = NEXT_PID;
@@ -1434,21 +1786,44 @@ fn process_spawn(name: &[u8], args: &[u8]) -> Option<usize> {
         }
 
         if let Some(index) = process_find_slot(table, ProcessState::Empty)
-            .or_else(|| process_find_slot(table, ProcessState::Exited))
-            .or_else(|| process_find_slot(table, ProcessState::Failed))
+            .or_else(|| process_find_reapable_slot(table))
         {
             let process = &mut (*table)[index];
             *process = Process::empty();
             process.pid = pid;
+            process.parent_pid = parent_pid;
             process.state = ProcessState::Ready;
             process.name_len = min(name.len(), PROCESS_NAME_MAX);
             process.name[..process.name_len].copy_from_slice(&name[..process.name_len]);
             process.args_len = min(args.len(), PROCESS_ARGS_MAX);
             process.args[..process.args_len].copy_from_slice(&args[..process.args_len]);
+            process.argv_count = min(argv.len(), PROCESS_ARGV_COUNT_MAX);
+            for (arg_index, arg) in argv[..process.argv_count].iter().enumerate() {
+                let arg_len = min(arg.len, PROCESS_ARGV_VALUE_MAX);
+                process.argv_lens[arg_index] = arg_len;
+                copy_nonoverlapping(arg.ptr, process.argv[arg_index].as_mut_ptr(), arg_len);
+            }
             return Some(index);
         }
     }
     None
+}
+
+fn raw_args_to_argv(args: &[u8], argv: &mut [ArgSlice; PROCESS_ARGV_COUNT_MAX]) -> usize {
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while count < PROCESS_ARGV_COUNT_MAX {
+        let Some((token, next)) = next_arg_token(args, index) else {
+            break;
+        };
+        argv[count] = ArgSlice {
+            ptr: token.as_ptr(),
+            len: token.len(),
+        };
+        count += 1;
+        index = next;
+    }
+    count
 }
 
 unsafe fn process_find_slot(
@@ -1463,6 +1838,26 @@ unsafe fn process_find_slot(
     None
 }
 
+/// A table slot that's safe to hand to a brand-new process: either never
+/// used, or an `Exited`/`Failed` zombie that's *already been reaped*
+/// (`waited == true`). An unwaited zombie must never be reused here --
+/// `process_wait_by_pid`/`process_wait_any_child` are how a parent collects
+/// its child's real exit status, and overwriting that slot before the parent
+/// ever calls `wait` would silently destroy it instead of `wait` correctly
+/// reporting "not found" (or, worse, blocking forever, once real blocking
+/// wait exists). Filling the table with genuinely unreaped zombies should
+/// fail spawn with `ERR_NOSPC`, matching real reaping semantics, not quietly
+/// corrupt one of them.
+unsafe fn process_find_reapable_slot(table: *mut [Process; PROCESS_COUNT]) -> Option<usize> {
+    for index in 0..PROCESS_COUNT {
+        let process = unsafe { &(*table)[index] };
+        if process.waited && matches!(process.state, ProcessState::Exited | ProcessState::Failed) {
+            return Some(index);
+        }
+    }
+    None
+}
+
 fn process_set_state(index: usize, state: ProcessState, exit_code: i32) {
     unsafe {
         let table = &raw mut PROCESS_TABLE;
@@ -1471,48 +1866,77 @@ fn process_set_state(index: usize, state: ProcessState, exit_code: i32) {
     }
 }
 
-fn process_can_track_heap_pages(index: usize, pages: usize) -> bool {
+/// Marks a top-level (console `run`-invoked) process `Failed` and already
+/// reaped. There is no ABI-level parent that will ever call `wait`/`wait_any`
+/// on a process started this way -- the console itself displayed the
+/// failure -- so it must not be left as an unreapable zombie under
+/// `process_find_reapable_slot`'s `waited` requirement the way a real
+/// spawned child correctly is.
+fn process_fail_unwaited(index: usize) {
+    process_set_state(index, ProcessState::Failed, -1);
     unsafe {
-        let table = &raw const PROCESS_TABLE;
-        index < PROCESS_COUNT && (*table)[index].heap_page_count + pages <= PROCESS_HEAP_PAGE_MAX
+        let table = &raw mut PROCESS_TABLE;
+        (*table)[index].waited = true;
     }
 }
 
-fn process_track_heap_page(index: usize, page: u64) -> bool {
+fn process_track_mapping(index: usize, virt: u64, pages: usize) -> bool {
     unsafe {
         if index >= PROCESS_COUNT {
             return false;
         }
         let table = &raw mut PROCESS_TABLE;
         let process = &mut (*table)[index];
-        if process.heap_page_count >= PROCESS_HEAP_PAGE_MAX {
-            return false;
+        for mapping in &mut process.mappings {
+            if !mapping.used {
+                *mapping = ProcessMapping {
+                    used: true,
+                    virt,
+                    pages,
+                };
+                return true;
+            }
         }
-        process.heap_pages[process.heap_page_count] = page;
-        process.heap_page_count += 1;
-        true
     }
+    false
 }
 
-fn process_reclaim_heap_pages(index: usize) -> usize {
+fn process_untrack_mapping(index: usize, virt: u64, pages: usize) -> bool {
+    unsafe {
+        if index >= PROCESS_COUNT {
+            return false;
+        }
+        let table = &raw mut PROCESS_TABLE;
+        let process = &mut (*table)[index];
+        for mapping in &mut process.mappings {
+            if mapping.used && mapping.virt == virt && mapping.pages == pages {
+                mapping.used = false;
+                mapping.virt = 0;
+                mapping.pages = 0;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn process_reclaim_mappings(index: usize) -> usize {
     unsafe {
         if index >= PROCESS_COUNT {
             return 0;
         }
         let table = &raw mut PROCESS_TABLE;
         let process = &mut (*table)[index];
-        let allocator = &mut *core::ptr::addr_of_mut!(PHYS_ALLOCATOR);
         let mut reclaimed = 0usize;
-        for page_index in 0..process.heap_page_count {
-            let page = process.heap_pages[page_index];
-            let virt = process.heap_base + page_index as u64 * PAGE_SIZE;
-            let unmapped = unmap_page(virt).unwrap_or(page);
-            if unmapped != 0 && allocator.free_page(unmapped) {
-                reclaimed += 1;
+        for mapping in &mut process.mappings {
+            if !mapping.used {
+                continue;
             }
-            process.heap_pages[page_index] = 0;
+            reclaimed += unmap_user_pages(KERNEL_PML4_PHYS, mapping.virt, mapping.pages);
+            *mapping = ProcessMapping::empty();
         }
         process.heap_base = 0;
+        process.heap_pages.fill(0);
         process.heap_page_count = 0;
         reclaimed
     }
@@ -1551,31 +1975,48 @@ fn process_list(console: &mut Console) {
 }
 
 fn process_wait(console: &mut Console, pid_bytes: &[u8]) {
+    if pid_bytes.is_empty() {
+        if let Some((pid, status)) = process_wait_any_child(0) {
+            print_process_status(console, pid, status);
+        } else {
+            console.write_line("wait: no child status");
+        }
+        return;
+    }
+
     let Some(pid) = parse_u32(pid_bytes) else {
         console.write_line("wait: invalid pid");
         return;
     };
 
-    if let Some(status) = process_status_by_pid(pid) {
-        console.write("pid ");
-        console.write_usize(pid as usize);
-        console.write(" ");
-        console.write(process_state_name(process_state_from_u32(status.state)));
-        console.write(" exit ");
-        console.write_i32(status.exit_code);
-        console.new_line();
+    if let Some(status) = process_wait_by_pid(pid) {
+        print_process_status(console, pid, status);
         return;
     }
 
     console.write_line("wait: pid not found");
 }
 
-fn process_status_by_pid(pid: u32) -> Option<RymosProcessStatus> {
+fn print_process_status(console: &mut Console, pid: u32, status: RymosProcessStatus) {
+    console.write("pid ");
+    console.write_usize(pid as usize);
+    console.write(" ");
+    console.write(process_state_name(process_state_from_u32(status.state)));
+    console.write(" exit ");
+    console.write_i32(status.exit_code);
+    console.new_line();
+}
+
+fn process_wait_by_pid(pid: u32) -> Option<RymosProcessStatus> {
     unsafe {
-        let table = &raw const PROCESS_TABLE;
+        let table = &raw mut PROCESS_TABLE;
         for index in 0..PROCESS_COUNT {
-            let process = &(*table)[index];
-            if process.pid == pid && !matches!(process.state, ProcessState::Empty) {
+            let process = &mut (*table)[index];
+            if process.pid == pid
+                && !process.waited
+                && matches!(process.state, ProcessState::Exited | ProcessState::Failed)
+            {
+                process.waited = true;
                 return Some(RymosProcessStatus {
                     state: process.state as u32,
                     exit_code: process.exit_code,
@@ -1584,6 +2025,63 @@ fn process_status_by_pid(pid: u32) -> Option<RymosProcessStatus> {
         }
     }
     None
+}
+
+fn process_wait_any_child(parent_pid: u32) -> Option<(u32, RymosProcessStatus)> {
+    unsafe {
+        let table = &raw mut PROCESS_TABLE;
+        for index in 0..PROCESS_COUNT {
+            let process = &mut (*table)[index];
+            if process.parent_pid == parent_pid
+                && !process.waited
+                && matches!(process.state, ProcessState::Exited | ProcessState::Failed)
+            {
+                process.waited = true;
+                return Some((
+                    process.pid,
+                    RymosProcessStatus {
+                        state: process.state as u32,
+                        exit_code: process.exit_code,
+                    },
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Table index of the process with this pid, if any (regardless of state).
+fn find_process_index_by_pid(pid: u32) -> Option<usize> {
+    unsafe {
+        let table = &raw const PROCESS_TABLE;
+        for index in 0..PROCESS_COUNT {
+            if (*table)[index].pid == pid && !matches!((*table)[index].state, ProcessState::Empty)
+            {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+/// Lowest-pid `Ready` (spawned but not yet actually run) child of `parent_pid`,
+/// if any. `Ready` now means genuinely not started -- see `spawn_prepared` and
+/// `run_ready_task`, which is the deferred-execution model for category 2.
+fn find_ready_child_of(parent_pid: u32) -> Option<usize> {
+    unsafe {
+        let table = &raw const PROCESS_TABLE;
+        let mut best: Option<usize> = None;
+        for index in 0..PROCESS_COUNT {
+            let process = &(*table)[index];
+            if process.parent_pid == parent_pid && matches!(process.state, ProcessState::Ready) {
+                best = match best {
+                    Some(current) if (*table)[current].pid <= process.pid => Some(current),
+                    _ => Some(index),
+                };
+            }
+        }
+        best
+    }
 }
 
 fn process_state_name(state: ProcessState) -> &'static str {
@@ -1786,14 +2284,16 @@ fn vmclone_command(console: &mut Console) {
 }
 
 fn ensure_kernel_pml4() -> Option<u64> {
-    let current_pml4 = read_cr3() & PAGE_ADDR_MASK;
     let kernel_pml4 = unsafe { KERNEL_PML4_PHYS };
     if kernel_pml4 != 0 {
-        if current_pml4 != kernel_pml4 {
-            unsafe {
-                write_cr3(kernel_pml4);
-            }
-        }
+        // Deliberately does NOT force CR3 back to `kernel_pml4` here. A
+        // process running in its own private PML4 (see
+        // `create_process_address_space`) shares every sub-table with
+        // `kernel_pml4` except the program-image range, so heap/mmap
+        // mappings created against `kernel_pml4` are visible through the
+        // process's own PML4 too -- forcing CR3 back would instead yank the
+        // currently-running process's private image mappings out from under
+        // it mid-execution.
         return Some(kernel_pml4);
     }
 
@@ -1803,6 +2303,24 @@ fn ensure_kernel_pml4() -> Option<u64> {
         write_cr3(new_pml4);
     }
     Some(new_pml4)
+}
+
+/// The PML4 the currently-running process should be restored to / is
+/// running under: its own private one if `create_process_address_space` gave
+/// it one, else the shared kernel PML4 (initializing it if this is the very
+/// first process/mapping activity since boot).
+fn current_pml4_or_kernel() -> Option<u64> {
+    let index = unsafe { APP_PROCESS_INDEX };
+    if index < PROCESS_COUNT {
+        let pml4 = unsafe {
+            let table = &raw const PROCESS_TABLE;
+            (*table)[index].pml4_phys
+        };
+        if pml4 != 0 {
+            return Some(pml4);
+        }
+    }
+    ensure_kernel_pml4()
 }
 
 fn ptalloc_command(console: &mut Console) {
@@ -1831,7 +2349,7 @@ fn maptest_command(console: &mut Console) {
         NEXT_SCRATCH_VIRT += PAGE_SIZE;
         virt
     };
-    if !map_page(virt, phys, PAGE_PRESENT | PAGE_WRITABLE) {
+    if !map_page(unsafe { KERNEL_PML4_PHYS }, virt, phys, PAGE_PRESENT | PAGE_WRITABLE) {
         console.write_line("maptest: map failed");
         return;
     }
@@ -1855,8 +2373,7 @@ fn maptest_command(console: &mut Console) {
     }
 }
 
-fn map_page(virt: u64, phys: u64, flags: u64) -> bool {
-    let pml4_phys = unsafe { KERNEL_PML4_PHYS };
+fn map_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> bool {
     if pml4_phys == 0 || virt & (PAGE_SIZE - 1) != 0 || phys & (PAGE_SIZE - 1) != 0 {
         return false;
     }
@@ -1903,8 +2420,7 @@ fn ensure_next_table(table: *mut u64, index: usize) -> Option<u64> {
     }
 }
 
-fn unmap_page(virt: u64) -> Option<u64> {
-    let pml4_phys = unsafe { KERNEL_PML4_PHYS };
+fn unmap_page(pml4_phys: u64, virt: u64) -> Option<u64> {
     if pml4_phys == 0 || virt & (PAGE_SIZE - 1) != 0 {
         return None;
     }
@@ -1928,6 +2444,84 @@ fn unmap_page(virt: u64) -> Option<u64> {
         invlpg(virt);
         Some(phys)
     }
+}
+
+fn map_user_pages(pml4_phys: u64, base: u64, page_count: usize) -> bool {
+    for index in 0..page_count {
+        let virt = base + index as u64 * PAGE_SIZE;
+        let Some(phys) = alloc_zeroed_page() else {
+            let _ = unmap_user_pages(pml4_phys, base, index);
+            return false;
+        };
+        if !map_page(pml4_phys, virt, phys, PAGE_PRESENT | PAGE_WRITABLE) {
+            let allocator = unsafe { &mut *core::ptr::addr_of_mut!(PHYS_ALLOCATOR) };
+            let _ = allocator.free_page(phys);
+            let _ = unmap_user_pages(pml4_phys, base, index);
+            return false;
+        }
+    }
+    true
+}
+
+fn unmap_user_pages(pml4_phys: u64, base: u64, page_count: usize) -> usize {
+    let allocator = unsafe { &mut *core::ptr::addr_of_mut!(PHYS_ALLOCATOR) };
+    let mut reclaimed = 0usize;
+    for index in 0..page_count {
+        let virt = base + index as u64 * PAGE_SIZE;
+        if let Some(phys) = unmap_page(pml4_phys, virt) {
+            if phys != 0 && allocator.free_page(phys) {
+                reclaimed += 1;
+            }
+        }
+    }
+    reclaimed
+}
+
+fn page_mapped(pml4_phys: u64, virt: u64) -> bool {
+    if pml4_phys == 0 || virt & (PAGE_SIZE - 1) != 0 {
+        return false;
+    }
+    let Some(pdpt_phys) = table_entry_address(pml4_phys as *mut u64, pml4_index(virt)) else {
+        return false;
+    };
+    let Some(pd_phys) = table_entry_address(pdpt_phys as *mut u64, pdpt_index(virt)) else {
+        return false;
+    };
+    let Some(pt_phys) = table_entry_address(pd_phys as *mut u64, pd_index(virt)) else {
+        return false;
+    };
+    table_entry_address(pt_phys as *mut u64, pt_index(virt)).is_some()
+}
+
+/// Like `map_user_pages`, but tolerant of pages that are already mapped --
+/// needed because different `PT_LOAD` segments (e.g. a `PT_GNU_RELRO` slice
+/// sharing a page with the preceding rodata segment) can legitimately share
+/// a page-aligned page. Sharing is harmless here: page table entries are
+/// always `PRESENT | WRITABLE` regardless of the ELF segment's nominal
+/// permissions (this kernel doesn't enforce read-only/executable at the
+/// page-table level yet), so a page mapped by an earlier segment is already
+/// exactly as accessible as one this function would have mapped itself.
+///
+/// Doesn't roll back its own partial progress on failure -- the caller
+/// (`load_program_elf_isolated`, via `spawn_prepared`) always cleans up
+/// through `destroy_process_address_space`, which frees every page still
+/// mapped in the process's private range regardless of which call put it
+/// there.
+fn map_image_pages(pml4_phys: u64, base: u64, page_count: usize) -> bool {
+    for index in 0..page_count {
+        let virt = base + index as u64 * PAGE_SIZE;
+        if page_mapped(pml4_phys, virt) {
+            continue;
+        }
+        let Some(phys) = alloc_zeroed_page() else {
+            return false;
+        };
+        if !map_page(pml4_phys, virt, phys, PAGE_PRESENT | PAGE_WRITABLE) {
+            let _ = free_phys_page(phys);
+            return false;
+        }
+    }
+    true
 }
 
 fn table_entry_address(table: *mut u64, index: usize) -> Option<u64> {
@@ -1954,12 +2548,146 @@ fn clone_active_pml4() -> Option<u64> {
     Some(new_pml4)
 }
 
+/// Gives a process its own private PML4 for the fixed program-image window
+/// (`APP_LOAD_MIN..APP_LOAD_MAX`) while keeping everything else (kernel code,
+/// heap/mmap windows, etc.) shared with the kernel's own page tables.
+///
+/// The image window falls under the same top-level PML4 entry and the same
+/// PDPT entry as the kernel's own low-memory mappings (both are well under
+/// 1 GiB), so a plain shallow PML4 clone isn't enough -- it would leave every
+/// process pointing at the *same* PDPT/PD/PT chain for that region. Instead
+/// this privatizes just the PDPT and PD covering the image window (copying
+/// their entries first, so anything outside the image range -- like the
+/// kernel's own PD entries -- keeps pointing at the original, shared page
+/// tables) and clears the PD entries the image loader will fill in fresh.
+///
+/// `pid` is the *child's* PID, needed to pre-touch the top-level PML4 entries
+/// for its heap/mmap windows (see `app_set_heap_window`'s address formula)
+/// before cloning. A shallow PML4 clone only copies whatever top-level
+/// entries already exist at clone time; if this is the first process ever to
+/// use a given 512 GiB slice of the heap/mmap range, the entry for it
+/// wouldn't exist yet in the kernel's own PML4, so the clone would capture a
+/// blank slot -- and by the time this process later calls `mem_alloc_pages`
+/// and the kernel's PML4 gains that entry, this process's *own* (already
+/// cloned, separate physical page) copy has no way to find out. Pre-touching
+/// first guarantees the entry exists in the shared kernel PML4 (and thus in
+/// every future clone, including this one) before the copy happens.
+fn create_process_address_space(pid: u32) -> Option<u64> {
+    let kernel_pml4 = ensure_kernel_pml4()?;
+    let heap_base = USER_HEAP_BASE + pid as u64 * USER_HEAP_STRIDE;
+    let mmap_base = USER_MMAP_BASE + pid as u64 * USER_MMAP_STRIDE;
+    ensure_next_table(kernel_pml4 as *mut u64, pml4_index(heap_base))?;
+    ensure_next_table(kernel_pml4 as *mut u64, pml4_index(mmap_base))?;
+    let new_pml4 = alloc_zeroed_page()?;
+    unsafe {
+        copy_nonoverlapping(
+            kernel_pml4 as *const u64,
+            new_pml4 as *mut u64,
+            PAGE_TABLE_ENTRIES,
+        );
+    }
+
+    let pml4_idx = pml4_index(APP_LOAD_MIN);
+    let pdpt_idx = pdpt_index(APP_LOAD_MIN);
+    let start_pd_index = pd_index(APP_LOAD_MIN);
+    let end_pd_index = pd_index(APP_LOAD_MAX - PAGE_SIZE) + 1;
+
+    let Some(shared_pdpt) = table_entry_address(new_pml4 as *mut u64, pml4_idx) else {
+        free_phys_page(new_pml4);
+        return None;
+    };
+    let Some(new_pdpt) = alloc_zeroed_page() else {
+        free_phys_page(new_pml4);
+        return None;
+    };
+    unsafe {
+        copy_nonoverlapping(
+            shared_pdpt as *const u64,
+            new_pdpt as *mut u64,
+            PAGE_TABLE_ENTRIES,
+        );
+    }
+
+    let Some(shared_pd) = table_entry_address(new_pdpt as *mut u64, pdpt_idx) else {
+        free_phys_page(new_pdpt);
+        free_phys_page(new_pml4);
+        return None;
+    };
+    let Some(new_pd) = alloc_zeroed_page() else {
+        free_phys_page(new_pdpt);
+        free_phys_page(new_pml4);
+        return None;
+    };
+    unsafe {
+        copy_nonoverlapping(
+            shared_pd as *const u64,
+            new_pd as *mut u64,
+            PAGE_TABLE_ENTRIES,
+        );
+        let pd_ptr = new_pd as *mut u64;
+        for pd_idx in start_pd_index..end_pd_index {
+            pd_ptr.add(pd_idx).write_volatile(0);
+        }
+    }
+
+    unsafe {
+        (new_pdpt as *mut u64)
+            .add(pdpt_idx)
+            .write_volatile((new_pd & PAGE_ADDR_MASK) | PAGE_PRESENT | PAGE_WRITABLE);
+        (new_pml4 as *mut u64)
+            .add(pml4_idx)
+            .write_volatile((new_pdpt & PAGE_ADDR_MASK) | PAGE_PRESENT | PAGE_WRITABLE);
+    }
+
+    Some(new_pml4)
+}
+
+/// Frees everything `create_process_address_space` allocated: the private
+/// PD/PDPT/PML4 structural pages, plus any data pages still mapped in the
+/// private image-window PD (the loader's segment pages, if the caller hasn't
+/// already unmapped them another way). Shared structures (anything outside
+/// the image window) are left untouched.
+fn destroy_process_address_space(pml4_phys: u64) {
+    if pml4_phys == 0 {
+        return;
+    }
+    let pml4_idx = pml4_index(APP_LOAD_MIN);
+    let pdpt_idx = pdpt_index(APP_LOAD_MIN);
+    let start_pd_index = pd_index(APP_LOAD_MIN);
+    let end_pd_index = pd_index(APP_LOAD_MAX - PAGE_SIZE) + 1;
+
+    if let Some(pdpt_phys) = table_entry_address(pml4_phys as *mut u64, pml4_idx) {
+        if let Some(pd_phys) = table_entry_address(pdpt_phys as *mut u64, pdpt_idx) {
+            for pd_idx in start_pd_index..end_pd_index {
+                if let Some(pt_phys) = table_entry_address(pd_phys as *mut u64, pd_idx) {
+                    for pt_idx in 0..PAGE_TABLE_ENTRIES {
+                        if let Some(data_phys) = table_entry_address(pt_phys as *mut u64, pt_idx) {
+                            free_phys_page(data_phys);
+                        }
+                    }
+                    free_phys_page(pt_phys);
+                }
+            }
+            free_phys_page(pd_phys);
+        }
+        free_phys_page(pdpt_phys);
+    }
+    free_phys_page(pml4_phys);
+}
+
 fn alloc_zeroed_page() -> Option<u64> {
     unsafe {
         let allocator = &mut *core::ptr::addr_of_mut!(PHYS_ALLOCATOR);
         let page = allocator.alloc_page()?;
         write_bytes(page as *mut u8, 0, PAGE_SIZE as usize);
         Some(page)
+    }
+}
+
+fn free_phys_page(phys: u64) -> bool {
+    unsafe {
+        let allocator = &mut *core::ptr::addr_of_mut!(PHYS_ALLOCATOR);
+        allocator.free_page(phys)
     }
 }
 
@@ -2035,7 +2763,7 @@ fn pfs_entry_kind(header: &[u8; PFS_HEADER_BYTES], index: usize) -> u8 {
 fn pfs_entry_name<'a>(header: &'a [u8; PFS_HEADER_BYTES], index: usize) -> &'a [u8] {
     let offset = pfs_entry_offset(index);
     let len = header[offset + 1] as usize;
-    &header[offset + 10..offset + 10 + len]
+    &header[offset + PFS_NAME_OFFSET..offset + PFS_NAME_OFFSET + len]
 }
 
 fn pfs_entry_size(header: &[u8; PFS_HEADER_BYTES], index: usize) -> usize {
@@ -2043,9 +2771,75 @@ fn pfs_entry_size(header: &[u8; PFS_HEADER_BYTES], index: usize) -> usize {
     read_le32_from_slice(&header[offset + 2..offset + 6]) as usize
 }
 
-fn pfs_entry_start(header: &[u8; PFS_HEADER_BYTES], index: usize) -> u32 {
+fn pfs_entry_extent_count(header: &[u8; PFS_HEADER_BYTES], index: usize) -> usize {
     let offset = pfs_entry_offset(index);
-    read_le32_from_slice(&header[offset + 6..offset + 10])
+    (header[offset + PFS_EXTENT_COUNT_OFFSET] as usize).min(PFS_MAX_EXTENTS)
+}
+
+fn pfs_entry_extent(header: &[u8; PFS_HEADER_BYTES], index: usize, slot: usize) -> PfsExtent {
+    let offset = pfs_entry_offset(index) + PFS_EXTENTS_OFFSET + slot * PFS_EXTENT_ENTRY_SIZE;
+    PfsExtent {
+        start: read_le32_from_slice(&header[offset..offset + 4]),
+        sectors: read_le32_from_slice(&header[offset + 4..offset + 8]),
+    }
+}
+
+/// Total sectors actually allocated to this entry across every extent. Can
+/// be more than `sectors_for_len(pfs_entry_size(...))` when a file has grown
+/// and shrunk without ever being fully rewritten -- allocation only ever
+/// grows in place (see `pfs_ensure_file_capacity`), it never shrinks a live
+/// entry's extents just because the logical size dropped.
+fn pfs_entry_total_sectors(header: &[u8; PFS_HEADER_BYTES], index: usize) -> u32 {
+    let count = pfs_entry_extent_count(header, index);
+    let mut total = 0u32;
+    for slot in 0..count {
+        total += pfs_entry_extent(header, index, slot).sectors;
+    }
+    total
+}
+
+/// Translates a logical (0-based, whole-file) sector index into the real
+/// disk LBA it lives at, by walking the entry's extent list. Replaces the
+/// old `start_sector + logical_sector` arithmetic now that a file's sectors
+/// aren't necessarily one contiguous run.
+fn pfs_entry_lba_for_sector(
+    header: &[u8; PFS_HEADER_BYTES],
+    index: usize,
+    logical_sector: u32,
+) -> Option<u32> {
+    let extent_count = pfs_entry_extent_count(header, index);
+    let mut remaining = logical_sector;
+    for slot in 0..extent_count {
+        let extent = pfs_entry_extent(header, index, slot);
+        if extent.sectors == 0 {
+            continue;
+        }
+        if remaining < extent.sectors {
+            return Some(extent.start + remaining);
+        }
+        remaining -= extent.sectors;
+    }
+    None
+}
+
+fn pfs_entry_created(header: &[u8; PFS_HEADER_BYTES], index: usize) -> u64 {
+    let offset = pfs_entry_offset(index) + PFS_CREATED_OFFSET;
+    read_le64_from_slice(&header[offset..offset + 8])
+}
+
+fn pfs_entry_modified(header: &[u8; PFS_HEADER_BYTES], index: usize) -> u64 {
+    let offset = pfs_entry_offset(index) + PFS_MODIFIED_OFFSET;
+    read_le64_from_slice(&header[offset..offset + 8])
+}
+
+fn pfs_entry_mode(header: &[u8; PFS_HEADER_BYTES], index: usize) -> u8 {
+    let offset = pfs_entry_offset(index);
+    header[offset + PFS_MODE_OFFSET]
+}
+
+fn pfs_touch_modified(header: &mut [u8; PFS_HEADER_BYTES], index: usize) {
+    let offset = pfs_entry_offset(index) + PFS_MODIFIED_OFFSET;
+    header[offset..offset + 8].copy_from_slice(&read_tsc().to_le_bytes());
 }
 
 fn pfs_find_entry(header: &[u8; PFS_HEADER_BYTES], name: &[u8]) -> Option<usize> {
@@ -2099,15 +2893,29 @@ fn pfs_set_entry(
     name: &[u8],
     size: usize,
     kind: u8,
-    start_sector: u32,
+    extents: &[PfsExtent],
+    created_ticks: u64,
+    mode: u8,
 ) {
     let offset = pfs_entry_offset(index);
+    let now = read_tsc();
     header[offset..offset + PFS_ENTRY_SIZE].fill(0);
     header[offset] = kind;
     header[offset + 1] = name.len() as u8;
     header[offset + 2..offset + 6].copy_from_slice(&(size as u32).to_le_bytes());
-    header[offset + 6..offset + 10].copy_from_slice(&start_sector.to_le_bytes());
-    header[offset + 10..offset + 10 + name.len()].copy_from_slice(name);
+    let extent_count = extents.len().min(PFS_MAX_EXTENTS);
+    header[offset + PFS_EXTENT_COUNT_OFFSET] = extent_count as u8;
+    for (slot, extent) in extents.iter().take(PFS_MAX_EXTENTS).enumerate() {
+        let extent_offset = offset + PFS_EXTENTS_OFFSET + slot * PFS_EXTENT_ENTRY_SIZE;
+        header[extent_offset..extent_offset + 4].copy_from_slice(&extent.start.to_le_bytes());
+        header[extent_offset + 4..extent_offset + 8].copy_from_slice(&extent.sectors.to_le_bytes());
+    }
+    let created_offset = offset + PFS_CREATED_OFFSET;
+    header[created_offset..created_offset + 8].copy_from_slice(&created_ticks.to_le_bytes());
+    let modified_offset = offset + PFS_MODIFIED_OFFSET;
+    header[modified_offset..modified_offset + 8].copy_from_slice(&now.to_le_bytes());
+    header[offset + PFS_MODE_OFFSET] = mode;
+    header[offset + PFS_NAME_OFFSET..offset + PFS_NAME_OFFSET + name.len()].copy_from_slice(name);
 }
 
 fn pfs_clear_entry(header: &mut [u8; PFS_HEADER_BYTES], index: usize) {
@@ -2148,8 +2956,23 @@ fn pfs_rename_header(
     }
     let kind = pfs_entry_kind(header, index);
     let size = pfs_entry_size(header, index);
-    let start_sector = pfs_entry_start(header, index);
-    pfs_set_entry(header, index, new_name, size, kind, start_sector);
+    let extent_count = pfs_entry_extent_count(header, index);
+    let mut extents = [PfsExtent::empty(); PFS_MAX_EXTENTS];
+    for slot in 0..extent_count {
+        extents[slot] = pfs_entry_extent(header, index, slot);
+    }
+    let created = pfs_entry_created(header, index);
+    let mode = pfs_entry_mode(header, index);
+    pfs_set_entry(
+        header,
+        index,
+        new_name,
+        size,
+        kind,
+        &extents[..extent_count],
+        created,
+        mode,
+    );
     Ok(())
 }
 
@@ -2217,6 +3040,38 @@ fn set_app_error(error: i32) -> i32 {
     -1
 }
 
+fn reset_app_std_fds() {
+    unsafe {
+        let std_fds = core::ptr::addr_of_mut!(APP_STD_FDS);
+        (*std_fds)[0] = STDIN_FD;
+        (*std_fds)[1] = STDOUT_FD;
+        (*std_fds)[2] = STDERR_FD;
+    }
+}
+
+fn app_resolve_fd(fd: i32) -> i32 {
+    if (STDIN_FD..=STDERR_FD).contains(&fd) {
+        unsafe {
+            let std_fds = core::ptr::addr_of!(APP_STD_FDS);
+            return (*std_fds)[fd as usize];
+        }
+    }
+    fd
+}
+
+fn app_fd_open(fd: i32) -> bool {
+    if (STDIN_FD..=STDERR_FD).contains(&fd) {
+        return true;
+    }
+    let Some(index) = app_fd_index(fd) else {
+        return false;
+    };
+    unsafe {
+        let table = core::ptr::addr_of!(APP_FDS);
+        (*table)[index].open
+    }
+}
+
 fn clear_app_error() {
     unsafe {
         APP_LAST_ERROR = ERR_OK;
@@ -2226,7 +3081,7 @@ fn clear_app_error() {
 fn app_cwd_is_pfs() -> bool {
     unsafe {
         let cwd = core::ptr::addr_of!(APP_CWD);
-        APP_CWD_LEN >= 4 && &(*cwd)[..4] == b"pfs:"
+        APP_CWD_LEN >= 4 && &(&(*cwd))[..4] == b"pfs:"
     }
 }
 
@@ -2237,7 +3092,7 @@ fn app_cwd_pfs_name<'a>(buffer: &'a mut [u8; PFS_NAME_MAX]) -> &'a [u8] {
             return &buffer[..0];
         }
         let len = min(APP_CWD_LEN - 4, PFS_NAME_MAX);
-        buffer[..len].copy_from_slice(&(*cwd)[4..4 + len]);
+        buffer[..len].copy_from_slice(&(&(*cwd))[4..4 + len]);
         &buffer[..len]
     }
 }
@@ -2373,6 +3228,14 @@ fn read_le32_from_slice(bytes: &[u8]) -> u32 {
         | ((bytes[1] as u32) << 8)
         | ((bytes[2] as u32) << 16)
         | ((bytes[3] as u32) << 24)
+}
+
+fn read_le64_from_slice(bytes: &[u8]) -> u64 {
+    let mut value: u64 = 0;
+    for index in 0..8 {
+        value |= (bytes[index] as u64) << (index * 8);
+    }
+    value
 }
 
 #[derive(Clone, Copy)]
@@ -2840,6 +3703,87 @@ extern "sysv64" fn abi_args(ptr: *mut u8, len: usize) -> usize {
     }
 }
 
+extern "sysv64" fn abi_argv_count() -> usize {
+    unsafe {
+        let process_index = APP_PROCESS_INDEX;
+        if process_index >= PROCESS_COUNT {
+            0
+        } else {
+            let table = core::ptr::addr_of!(PROCESS_TABLE);
+            1 + (*table)[process_index].argv_count
+        }
+    }
+}
+
+extern "sysv64" fn abi_argv_get(index: usize, ptr: *mut u8, len: usize) -> isize {
+    let mut name = [0u8; PROCESS_NAME_MAX];
+    let Some(value_len) = copy_argv_value(index, &mut name, ptr, len) else {
+        return set_app_error(ERR_NOENT) as isize;
+    };
+    clear_app_error();
+    value_len as isize
+}
+
+fn copy_argv_value(
+    index: usize,
+    process_name: &mut [u8; PROCESS_NAME_MAX],
+    ptr: *mut u8,
+    len: usize,
+) -> Option<usize> {
+    let value = if index == 0 {
+        let process_index = unsafe { APP_PROCESS_INDEX };
+        if process_index >= PROCESS_COUNT {
+            return None;
+        }
+        unsafe {
+            let table = core::ptr::addr_of!(PROCESS_TABLE);
+            let process = &(*table)[process_index];
+            process_name[..process.name_len].copy_from_slice(&process.name[..process.name_len]);
+            &process_name[..process.name_len]
+        }
+    } else {
+        let process_index = unsafe { APP_PROCESS_INDEX };
+        if process_index >= PROCESS_COUNT {
+            return None;
+        }
+        unsafe {
+            let table = core::ptr::addr_of!(PROCESS_TABLE);
+            let process = &(*table)[process_index];
+            let arg_index = index - 1;
+            if arg_index >= process.argv_count {
+                return None;
+            }
+            &process.argv[arg_index][..process.argv_lens[arg_index]]
+        }
+    };
+
+    if !ptr.is_null() && len > 0 {
+        let copy_len = min(len, value.len());
+        unsafe {
+            copy_nonoverlapping(value.as_ptr(), ptr, copy_len);
+        }
+    }
+    Some(value.len())
+}
+
+fn next_arg_token(args: &[u8], mut index: usize) -> Option<(&[u8], usize)> {
+    while index < args.len() && is_arg_space(args[index]) {
+        index += 1;
+    }
+    if index >= args.len() {
+        return None;
+    }
+    let start = index;
+    while index < args.len() && !is_arg_space(args[index]) {
+        index += 1;
+    }
+    Some((&args[start..index], index))
+}
+
+fn is_arg_space(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t' || byte == b'\n' || byte == b'\r'
+}
+
 extern "sysv64" fn abi_read_line(ptr: *mut u8, len: usize) -> usize {
     if ptr.is_null() || len == 0 {
         return 0;
@@ -2920,21 +3864,25 @@ extern "sysv64" fn abi_file_read(
 
 extern "sysv64" fn abi_open(path_ptr: *const u8, path_len: usize, flags: u32) -> i32 {
     let Some(path) = checked_app_slice(path_ptr, path_len) else {
-        return -1;
+        return set_app_error(ERR_INVAL);
     };
 
+    let mut pfs_name = [0u8; PFS_NAME_MAX];
+    if let Some(name_len) = pfs_resolve_path(path, &mut pfs_name) {
+        return abi_open_pfs(&pfs_name[..name_len], flags);
+    }
     if starts_with(path, b"pfs:") {
-        return abi_open_pfs(&path[4..], flags);
+        return set_app_error(ERR_INVAL);
     }
 
     if flags & FD_WRITE != 0 {
-        return -1;
+        return set_app_error(ERR_INVAL);
     }
 
     unsafe {
         let bootfs = APP_BOOTFS;
         let Some(data) = bootfs.find_data(path) else {
-            return -1;
+            return set_app_error(ERR_NOENT);
         };
         let table = core::ptr::addr_of_mut!(APP_FDS);
         let table = &mut *table;
@@ -2949,48 +3897,76 @@ extern "sysv64" fn abi_open(path_ptr: *const u8, path_len: usize, flags: u32) ->
                     offset: 0,
                     pfs_index: 0,
                 };
+                clear_app_error();
                 return index as i32 + APP_FD_BASE;
             }
         }
     }
 
-    -1
+    set_app_error(ERR_NOSPC)
 }
 
 fn abi_open_pfs(name: &[u8], flags: u32) -> i32 {
     if !valid_pfs_path(name) {
-        return -1;
+        return set_app_error(ERR_INVAL);
+    }
+    if flags & FD_CREATE_NEW != 0 && flags & FD_CREATE == 0 {
+        return set_app_error(ERR_INVAL);
+    }
+    if flags & FD_TRUNCATE != 0 && flags & FD_WRITE == 0 {
+        return set_app_error(ERR_INVAL);
+    }
+    if flags & FD_APPEND != 0 && flags & FD_WRITE == 0 {
+        return set_app_error(ERR_INVAL);
     }
 
     let Some(mut header) = PersistentFs::read_header_silent() else {
-        return -1;
+        return set_app_error(ERR_IO);
     };
     if !pfs_parent_exists(&header, name) {
-        return -1;
+        return set_app_error(ERR_NOENT);
     }
     let index = match pfs_find_entry(&header, name) {
-        Some(index) if pfs_entry_is_dir(&header, index) => return -1,
+        Some(index) if pfs_entry_is_dir(&header, index) => return set_app_error(ERR_ISDIR),
+        Some(_) if flags & FD_CREATE_NEW != 0 => return set_app_error(ERR_EXIST),
         Some(index) => index,
         None if flags & FD_CREATE != 0 => {
             let Some(index) = pfs_free_entry(&header) else {
-                return -1;
+                return set_app_error(ERR_NOSPC);
             };
-            pfs_set_entry(&mut header, index, name, 0, PFS_KIND_FILE, 0);
+            pfs_set_entry(
+                &mut header,
+                index,
+                name,
+                0,
+                PFS_KIND_FILE,
+                &[],
+                read_tsc(),
+                PFS_MODE_DEFAULT_FILE,
+            );
             if !PersistentFs::write_header(&header) {
-                return -1;
+                return set_app_error(ERR_IO);
             }
             index
         }
-        None => return -1,
+        None => return set_app_error(ERR_NOENT),
     };
 
     if flags & FD_TRUNCATE != 0 {
-        if flags & FD_WRITE == 0 {
-            return -1;
-        }
-        pfs_set_entry(&mut header, index, name, 0, PFS_KIND_FILE, 0);
+        let created = pfs_entry_created(&header, index);
+        let mode = pfs_entry_mode(&header, index);
+        pfs_set_entry(
+            &mut header,
+            index,
+            name,
+            0,
+            PFS_KIND_FILE,
+            &[],
+            created,
+            mode,
+        );
         if !PersistentFs::write_header(&header) {
-            return -1;
+            return set_app_error(ERR_IO);
         }
     }
 
@@ -3006,17 +3982,19 @@ fn abi_open_pfs(name: &[u8], flags: u32) -> i32 {
                     flags,
                     data: core::ptr::null(),
                     len,
-                    offset: 0,
+                    offset: if flags & FD_APPEND != 0 { len } else { 0 },
                     pfs_index: index,
                 };
+                clear_app_error();
                 return fd as i32 + APP_FD_BASE;
             }
         }
     }
-    -1
+    set_app_error(ERR_NOSPC)
 }
 
 extern "sysv64" fn abi_read(fd: i32, buffer_ptr: *mut u8, buffer_len: usize) -> isize {
+    let fd = app_resolve_fd(fd);
     if fd < 0 || buffer_ptr.is_null() {
         return -1;
     }
@@ -3037,6 +4015,29 @@ extern "sysv64" fn abi_read(fd: i32, buffer_ptr: *mut u8, buffer_len: usize) -> 
         if handle.flags & FD_READ == 0 {
             return -1;
         }
+        if handle.kind == AppFdKind::PipeRead {
+            let pipes = core::ptr::addr_of_mut!(APP_PIPES);
+            let pipe = &mut (*pipes)[handle.pfs_index];
+            if !pipe.used || !pipe.read_open {
+                return -1;
+            }
+            let available = pipe.len.saturating_sub(pipe.read_offset);
+            let pipe_copy = min(buffer_len, available);
+            if pipe_copy == 0 {
+                return 0;
+            }
+            copy_nonoverlapping(
+                pipe.buffer[pipe.read_offset..].as_ptr(),
+                buffer_ptr,
+                pipe_copy,
+            );
+            pipe.read_offset += pipe_copy;
+            if pipe.read_offset == pipe.len {
+                pipe.read_offset = 0;
+                pipe.len = 0;
+            }
+            return pipe_copy as isize;
+        }
         let remaining = handle.len.saturating_sub(handle.offset);
         let copy_len = min(buffer_len, remaining);
         if copy_len == 0 {
@@ -3052,6 +4053,8 @@ extern "sysv64" fn abi_read(fd: i32, buffer_ptr: *mut u8, buffer_len: usize) -> 
                     return -1;
                 }
             }
+            AppFdKind::PipeRead => return -1,
+            AppFdKind::PipeWrite => return -1,
             AppFdKind::Empty => return -1,
         }
         handle.offset += copy_len;
@@ -3060,6 +4063,7 @@ extern "sysv64" fn abi_read(fd: i32, buffer_ptr: *mut u8, buffer_len: usize) -> 
 }
 
 extern "sysv64" fn abi_write_fd(fd: i32, buffer_ptr: *const u8, buffer_len: usize) -> isize {
+    let fd = app_resolve_fd(fd);
     if fd < 0 || buffer_ptr.is_null() {
         return -1;
     }
@@ -3075,8 +4079,30 @@ extern "sysv64" fn abi_write_fd(fd: i32, buffer_ptr: *const u8, buffer_len: usiz
         let table = core::ptr::addr_of_mut!(APP_FDS);
         let table = &mut *table;
         let handle = &mut table[index];
-        if !handle.open || handle.flags & FD_WRITE == 0 || handle.kind != AppFdKind::Pfs {
+        if !handle.open || handle.flags & FD_WRITE == 0 {
             return -1;
+        }
+        if handle.kind == AppFdKind::PipeWrite {
+            let pipes = core::ptr::addr_of_mut!(APP_PIPES);
+            let pipe = &mut (*pipes)[handle.pfs_index];
+            if !pipe.used || !pipe.write_open || !pipe.read_open {
+                return -1;
+            }
+            let available = APP_PIPE_BUFFER_SIZE.saturating_sub(pipe.len);
+            let write_len = min(buffer_len, available);
+            if write_len == 0 && buffer_len != 0 {
+                return -1;
+            }
+            let data = core::slice::from_raw_parts(buffer_ptr, write_len);
+            pipe.buffer[pipe.len..pipe.len + write_len].copy_from_slice(data);
+            pipe.len += write_len;
+            return write_len as isize;
+        }
+        if handle.kind != AppFdKind::Pfs {
+            return -1;
+        }
+        if handle.flags & FD_APPEND != 0 {
+            handle.offset = handle.len;
         }
         if handle.offset + buffer_len > PFS_FILE_MAX {
             return -1;
@@ -3108,7 +4134,16 @@ extern "sysv64" fn abi_seek(fd: i32, offset: usize) -> isize {
         let table = core::ptr::addr_of_mut!(APP_FDS);
         let table = &mut *table;
         let handle = &mut table[index];
-        if !handle.open || offset > handle.len {
+        if !handle.open {
+            return -1;
+        }
+        // Seeking past the current end is legal (POSIX lseek semantics): it
+        // only actually extends the file once something is written there,
+        // and pfs_write_at zero-fills the gap in between (see
+        // pfs_zero_range) so the hole reads back as zero, not stale data.
+        // BootFS handles are read-only ROM data with a fixed length, so
+        // still clamp those to their real size.
+        if handle.kind == AppFdKind::BootFs && offset > handle.len {
             return -1;
         }
         handle.offset = offset;
@@ -3121,6 +4156,10 @@ extern "sysv64" fn abi_close(fd: i32) -> i32 {
         return -1;
     }
     if fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD {
+        unsafe {
+            let std_fds = core::ptr::addr_of_mut!(APP_STD_FDS);
+            (*std_fds)[fd as usize] = fd;
+        }
         return 0;
     }
     let Some(index) = app_fd_index(fd) else {
@@ -3132,6 +4171,25 @@ extern "sysv64" fn abi_close(fd: i32) -> i32 {
         let table = &mut *table;
         if !table[index].open {
             return -1;
+        }
+        match table[index].kind {
+            AppFdKind::PipeRead => {
+                let pipes = core::ptr::addr_of_mut!(APP_PIPES);
+                let pipe = &mut (*pipes)[table[index].pfs_index];
+                pipe.read_open = false;
+                if !pipe.write_open {
+                    *pipe = AppPipe::empty();
+                }
+            }
+            AppFdKind::PipeWrite => {
+                let pipes = core::ptr::addr_of_mut!(APP_PIPES);
+                let pipe = &mut (*pipes)[table[index].pfs_index];
+                pipe.write_open = false;
+                if !pipe.read_open {
+                    *pipe = AppPipe::empty();
+                }
+            }
+            _ => {}
         }
         table[index] = AppFd::empty();
     }
@@ -3152,18 +4210,19 @@ fn app_fd_index(fd: i32) -> Option<usize> {
 
 extern "sysv64" fn abi_stat(path_ptr: *const u8, path_len: usize, stat_ptr: *mut RymosStat) -> i32 {
     if stat_ptr.is_null() {
-        return -1;
+        return set_app_error(ERR_INVAL);
     }
     let Some(path) = checked_app_slice(path_ptr, path_len) else {
-        return -1;
+        return set_app_error(ERR_INVAL);
     };
 
     let Some(stat) = stat_path(path) else {
-        return -1;
+        return set_app_error(ERR_NOENT);
     };
     unsafe {
         stat_ptr.write(stat);
     }
+    clear_app_error();
     0
 }
 
@@ -3176,20 +4235,35 @@ extern "sysv64" fn abi_list(
     stat_ptr: *mut RymosStat,
 ) -> isize {
     if name_ptr.is_null() || name_len == 0 || stat_ptr.is_null() {
-        return -1;
+        return set_app_error(ERR_INVAL) as isize;
     }
     let namespace = if namespace_ptr.is_null() || namespace_len == 0 {
         b"".as_slice()
     } else {
         let Some(namespace) = checked_app_slice(namespace_ptr, namespace_len) else {
-            return -1;
+            return set_app_error(ERR_INVAL) as isize;
         };
         namespace
     };
 
-    if starts_with(namespace, b"pfs:") {
+    let mut resolved = [0u8; PFS_NAME_MAX];
+    let pfs_namespace: Option<&[u8]> = if namespace.is_empty() && app_cwd_is_pfs() {
+        let mut cwd_name = [0u8; PFS_NAME_MAX];
+        let cwd = app_cwd_pfs_name(&mut cwd_name);
+        let len = cwd.len();
+        resolved[..len].copy_from_slice(cwd);
+        Some(&resolved[..len])
+    } else if eq(namespace, b"pfs:") || eq(namespace, b"pfs:/") {
+        Some(b"")
+    } else if let Some(len) = pfs_resolve_path(namespace, &mut resolved) {
+        Some(&resolved[..len])
+    } else {
+        None
+    };
+
+    if let Some(namespace) = pfs_namespace {
         let Some(header) = PersistentFs::read_header_silent() else {
-            return -1;
+            return set_app_error(ERR_IO) as isize;
         };
         let mut seen = 0usize;
         for entry_index in 0..PFS_ENTRY_COUNT {
@@ -3210,55 +4284,68 @@ extern "sysv64" fn abi_list(
                             },
                             fs: STAT_FS_PFS,
                             size: pfs_entry_size(&header, entry_index),
+                            created_ticks: pfs_entry_created(&header, entry_index),
+                            modified_ticks: pfs_entry_modified(&header, entry_index),
+                            mode: pfs_entry_mode(&header, entry_index) as u32,
                         });
                     }
+                    clear_app_error();
                     return copy_len as isize;
                 }
                 seen += 1;
             }
         }
-        return -1;
+        return set_app_error(ERR_NOENT) as isize;
     }
 
     let Some((name, stat)) = list_bootfs(index) else {
-        return -1;
+        return set_app_error(ERR_NOENT) as isize;
     };
     let copy_len = min(name_len, name.len());
     unsafe {
         copy_nonoverlapping(name.as_ptr(), name_ptr, copy_len);
         stat_ptr.write(stat);
     }
+    clear_app_error();
     copy_len as isize
 }
 
 extern "sysv64" fn abi_mkdir(path_ptr: *const u8, path_len: usize) -> i32 {
     let Some(path) = checked_app_slice(path_ptr, path_len) else {
-        return -1;
+        return set_app_error(ERR_INVAL);
     };
-    if !starts_with(path, b"pfs:") {
-        return -1;
-    }
-    let name = &path[4..];
-    if !valid_pfs_path(name) {
-        return -1;
-    }
+    let mut resolved = [0u8; PFS_NAME_MAX];
+    let Some(name_len) = pfs_resolve_path(path, &mut resolved) else {
+        return set_app_error(ERR_INVAL);
+    };
+    let name = &resolved[..name_len];
     let Some(mut header) = PersistentFs::read_header_silent() else {
-        return -1;
+        return set_app_error(ERR_IO);
     };
     if !pfs_parent_exists(&header, name) {
-        return -1;
+        return set_app_error(ERR_NOENT);
     }
     if pfs_find_entry(&header, name).is_some() {
-        return -1;
+        return set_app_error(ERR_EXIST);
     }
     let Some(index) = pfs_free_entry(&header) else {
-        return -1;
+        return set_app_error(ERR_NOSPC);
     };
-    pfs_set_entry(&mut header, index, name, 0, PFS_KIND_DIR, 0);
+    pfs_set_entry(
+        &mut header,
+        index,
+        name,
+        0,
+        PFS_KIND_DIR,
+        &[],
+        read_tsc(),
+        PFS_MODE_DEFAULT_DIR,
+    );
     if PersistentFs::write_header(&header) {
+        clear_app_error();
         0
     } else {
-        -1
+        set_app_error(ERR_IO)
     }
 }
 
@@ -3269,21 +4356,21 @@ extern "sysv64" fn abi_env_get(
     value_len: usize,
 ) -> isize {
     let Some(key) = checked_app_slice(key_ptr, key_len) else {
-        return -1;
+        return set_app_error(ERR_INVAL) as isize;
     };
-    for (env_key, env_value) in ENV {
-        if env_key == key {
-            if value_ptr.is_null() || value_len == 0 {
-                return env_value.len() as isize;
-            }
-            let copy_len = min(value_len, env_value.len());
-            unsafe {
-                copy_nonoverlapping(env_value.as_ptr(), value_ptr, copy_len);
-            }
-            return copy_len as isize;
-        }
+    let Some(value) = env_lookup(key) else {
+        return set_app_error(ERR_NOENT) as isize;
+    };
+    if value_ptr.is_null() || value_len == 0 {
+        clear_app_error();
+        return value.len() as isize;
     }
-    -1
+    let copy_len = min(value_len, value.len());
+    unsafe {
+        copy_nonoverlapping(value.as_ptr(), value_ptr, copy_len);
+    }
+    clear_app_error();
+    copy_len as isize
 }
 
 extern "sysv64" fn abi_env_list(
@@ -3293,17 +4380,139 @@ extern "sysv64" fn abi_env_list(
     value_ptr: *mut u8,
     value_len: usize,
 ) -> isize {
-    if index >= ENV_COUNT || key_ptr.is_null() || value_ptr.is_null() {
-        return -1;
+    if key_ptr.is_null() || value_ptr.is_null() {
+        return set_app_error(ERR_INVAL) as isize;
     }
-    let (key, value) = ENV[index];
+    let Some((key, value)) = env_list_entry(index) else {
+        return set_app_error(ERR_NOENT) as isize;
+    };
     let key_copy = min(key_len, key.len());
     let value_copy = min(value_len, value.len());
     unsafe {
         copy_nonoverlapping(key.as_ptr(), key_ptr, key_copy);
         copy_nonoverlapping(value.as_ptr(), value_ptr, value_copy);
     }
+    clear_app_error();
     ((key_copy as isize) << 32) | value_copy as isize
+}
+
+extern "sysv64" fn abi_env_set(
+    key_ptr: *const u8,
+    key_len: usize,
+    value_ptr: *const u8,
+    value_len: usize,
+) -> i32 {
+    let Some(key) = checked_app_slice(key_ptr, key_len) else {
+        return set_app_error(ERR_INVAL);
+    };
+    let Some(value) = checked_app_slice(value_ptr, value_len) else {
+        return set_app_error(ERR_INVAL);
+    };
+    env_set_overlay(key, value, false)
+}
+
+extern "sysv64" fn abi_env_remove(key_ptr: *const u8, key_len: usize) -> i32 {
+    let Some(key) = checked_app_slice(key_ptr, key_len) else {
+        return set_app_error(ERR_INVAL);
+    };
+    env_set_overlay(key, b"", true)
+}
+
+fn env_lookup<'a>(key: &[u8]) -> Option<&'a [u8]> {
+    unsafe {
+        let app_env = core::ptr::addr_of!(APP_ENV);
+        for entry in &*app_env {
+            if entry.used && &entry.key[..entry.key_len] == key {
+                if entry.deleted {
+                    return None;
+                }
+                return Some(&entry.value[..entry.value_len]);
+            }
+        }
+    }
+    for (env_key, env_value) in ENV {
+        if env_key == key {
+            return Some(env_value);
+        }
+    }
+    None
+}
+
+fn env_list_entry<'a>(wanted: usize) -> Option<(&'a [u8], &'a [u8])> {
+    let mut seen = 0usize;
+    unsafe {
+        let app_env = core::ptr::addr_of!(APP_ENV);
+        for entry in &*app_env {
+            if entry.used && !entry.deleted {
+                if seen == wanted {
+                    return Some((&entry.key[..entry.key_len], &entry.value[..entry.value_len]));
+                }
+                seen += 1;
+            }
+        }
+    }
+    for (key, value) in ENV {
+        if env_overlay_has_key(key) {
+            continue;
+        }
+        if seen == wanted {
+            return Some((key, value));
+        }
+        seen += 1;
+    }
+    None
+}
+
+fn env_overlay_has_key(key: &[u8]) -> bool {
+    unsafe {
+        let app_env = core::ptr::addr_of!(APP_ENV);
+        for entry in &*app_env {
+            if entry.used && &entry.key[..entry.key_len] == key {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn env_set_overlay(key: &[u8], value: &[u8], deleted: bool) -> i32 {
+    if key.is_empty()
+        || key.len() > APP_ENV_KEY_MAX
+        || value.len() > APP_ENV_VALUE_MAX
+        || key.iter().any(|byte| *byte == b'=' || *byte == 0)
+    {
+        return set_app_error(ERR_INVAL);
+    }
+
+    unsafe {
+        let app_env = core::ptr::addr_of_mut!(APP_ENV);
+        let mut slot = APP_ENV_COUNT;
+        for index in 0..APP_ENV_COUNT {
+            if (*app_env)[index].used
+                && &(&(*app_env)[index].key)[..(*app_env)[index].key_len] == key
+            {
+                slot = index;
+                break;
+            }
+            if slot == APP_ENV_COUNT && !(*app_env)[index].used {
+                slot = index;
+            }
+        }
+        if slot == APP_ENV_COUNT {
+            return set_app_error(ERR_NOSPC);
+        }
+
+        let entry = &mut (*app_env)[slot];
+        *entry = AppEnvVar::empty();
+        entry.used = true;
+        entry.deleted = deleted;
+        entry.key_len = key.len();
+        entry.key[..key.len()].copy_from_slice(key);
+        entry.value_len = value.len();
+        entry.value[..value.len()].copy_from_slice(value);
+    }
+    clear_app_error();
+    0
 }
 
 extern "sysv64" fn abi_spawn(
@@ -3313,50 +4522,307 @@ extern "sysv64" fn abi_spawn(
     args_len: usize,
 ) -> i32 {
     let Some(name) = checked_app_slice(name_ptr, name_len) else {
-        return -1;
+        return set_app_error(ERR_INVAL);
     };
     if name.is_empty() || name.len() > PROCESS_NAME_MAX {
-        return -1;
+        return set_app_error(ERR_INVAL);
     }
-    if args_len != 0 {
+    let args = if args_len == 0 {
+        b"".as_slice()
+    } else {
         let Some(args) = checked_app_slice(args_ptr, args_len) else {
-            return -1;
+            return set_app_error(ERR_INVAL);
         };
-        if args.len() > PROCESS_ARGS_MAX {
-            return -1;
-        }
+        args
+    };
+    if args.len() > PROCESS_ARGS_MAX {
+        return set_app_error(ERR_INVAL);
     }
 
-    // Programs are still loaded at fixed physical addresses, so a child load
-    // would overwrite the caller. Keep the ABI slot stable while the loader
-    // grows relocatable or isolated address spaces.
-    -2
+    spawn_prepared(name, args, None)
+}
+
+extern "sysv64" fn abi_spawn_argv(
+    name_ptr: *const u8,
+    name_len: usize,
+    argv_ptr: *const ArgSlice,
+    argv_len: usize,
+) -> i32 {
+    let Some(name) = checked_app_slice(name_ptr, name_len) else {
+        return set_app_error(ERR_INVAL);
+    };
+    if name.is_empty() || name.len() > PROCESS_NAME_MAX || argv_len > PROCESS_ARGV_COUNT_MAX {
+        return set_app_error(ERR_INVAL);
+    }
+    if argv_len > 0 && argv_ptr.is_null() {
+        return set_app_error(ERR_INVAL);
+    }
+
+    let mut arg_storage = [[0u8; PROCESS_ARGV_VALUE_MAX]; PROCESS_ARGV_COUNT_MAX];
+    let mut argv = [ArgSlice::empty(); PROCESS_ARGV_COUNT_MAX];
+    let mut raw_args = [0u8; PROCESS_ARGS_MAX];
+    let mut raw_len = 0usize;
+
+    for index in 0..argv_len {
+        let arg = unsafe { *argv_ptr.add(index) };
+        if arg.ptr.is_null() || arg.len > PROCESS_ARGV_VALUE_MAX {
+            return set_app_error(ERR_INVAL);
+        }
+        let Some(arg_bytes) = checked_app_slice(arg.ptr, arg.len) else {
+            return set_app_error(ERR_INVAL);
+        };
+        arg_storage[index][..arg.len].copy_from_slice(arg_bytes);
+        argv[index] = ArgSlice {
+            ptr: arg_storage[index].as_ptr(),
+            len: arg.len,
+        };
+        let separator = usize::from(raw_len > 0);
+        if raw_len + separator + arg.len > PROCESS_ARGS_MAX {
+            return set_app_error(ERR_NOSPC);
+        }
+        if separator == 1 {
+            raw_args[raw_len] = b' ';
+            raw_len += 1;
+        }
+        raw_args[raw_len..raw_len + arg.len].copy_from_slice(arg_bytes);
+        raw_len += arg.len;
+    }
+
+    spawn_prepared(name, &raw_args[..raw_len], Some(&argv[..argv_len]))
+}
+
+/// Registers a child in the process table and runs it to completion via
+/// `run_ready_task` before returning its pid.
+///
+/// A genuinely deferred version of this (enqueue and return immediately,
+/// letting `wait`/`wait_any` run pending children later) was tried and
+/// reverted: it silently broke every existing `spawn`-then-read-a-pipe
+/// caller that has no intervening `wait()` at all -- several of rysh's own
+/// shell built-ins (`spawnredir`, `spawnstdin`, `spawnio`, `spawnioe`) read a
+/// redirected pipe's output immediately after `spawn()` purely because
+/// `spawn()` used to block until the child finished; deferring it left the
+/// pipe empty (or, worse, closed before the child ever ran). Fixing every
+/// affected caller across rysh and the `Command` helpers in `rymos-user`
+/// would be its own large, separate audit, not a bounded piece of category
+/// 2 -- caught live via a genuine QEMU hang (100% CPU, `echoin` spinning on
+/// stdin that was never actually connected), not just reasoned about.
+/// `run_ready_task` and the `Ready`-child lookups it enabled are kept (see
+/// `find_ready_child_of`, and the exit-time drain in `run_ready_task`/
+/// `run_program`) as a harmless defense-in-depth safety net, but nothing
+/// relies on them actually finding anything under this eager model.
+///
+/// Real concurrent (interleaved) execution still needs the ABI state to move
+/// into a real per-process control block (today it's flat globals like
+/// `APP_FDS`/`APP_CWD`/`APP_ENV`) plus either a scheduler with saved
+/// per-process CPU context or full preemption -- unchanged from before this
+/// attempt, and flagged in the roadmap as the next, separate lift.
+fn spawn_prepared(name: &[u8], args: &[u8], argv: Option<&[ArgSlice]>) -> i32 {
+    let bootfs = unsafe { APP_BOOTFS };
+
+    let parent_process_index = unsafe { APP_PROCESS_INDEX };
+    if parent_process_index >= PROCESS_COUNT {
+        return set_app_error(ERR_INVAL);
+    }
+
+    let mut child_path = [0u8; 32];
+    let child_path_len = program_path(name, &mut child_path);
+    if bootfs.find_data(&child_path[..child_path_len]).is_none() {
+        return set_app_error(ERR_NOENT);
+    }
+
+    let child_process_index = if let Some(argv) = argv {
+        process_spawn_with_argv(name, args, argv, unsafe { APP_PID })
+    } else {
+        process_spawn(name, args)
+    };
+    let Some(child_process_index) = child_process_index else {
+        return set_app_error(ERR_NOSPC);
+    };
+
+    // Capture the caller's std-fd/cwd/env redirection state right now, not
+    // when the child actually runs -- see the `Process::inherited_*` field
+    // docs for why this has to happen here.
+    unsafe {
+        let table = &raw mut PROCESS_TABLE;
+        let process = &mut (*table)[child_process_index];
+        process.inherited_std_fds = *core::ptr::addr_of!(APP_STD_FDS);
+        process.inherited_cwd = *core::ptr::addr_of!(APP_CWD);
+        process.inherited_cwd_len = APP_CWD_LEN;
+        process.inherited_env = *core::ptr::addr_of!(APP_ENV);
+    }
+
+    run_ready_task(child_process_index);
+    clear_app_error();
+    process_pid(child_process_index) as i32
+}
+
+/// Actually runs a previously-enqueued (`Ready`) child to completion: builds
+/// its isolated address space, loads its ELF image, runs it, then drains any
+/// children *it* spawned but never waited on before finalizing its own exit
+/// (recursively -- a grandchild left pending gets the same treatment). See
+/// `spawn_prepared` for why this is deferred instead of running inline.
+fn run_ready_task(child_index: usize) -> i32 {
+    let Some(console) = (unsafe { APP_CONSOLE.as_mut() }) else {
+        process_set_state(child_index, ProcessState::Failed, -1);
+        return -1;
+    };
+    let bootfs = unsafe { APP_BOOTFS };
+
+    let (child_pid, name_len, child_name) = unsafe {
+        let table = &raw const PROCESS_TABLE;
+        let process = &(*table)[child_index];
+        (process.pid, process.name_len, process.name)
+    };
+
+    let mut child_path = [0u8; 32];
+    let child_path_len = program_path(&child_name[..name_len], &mut child_path);
+    let Some(child_image) = bootfs.find_data(&child_path[..child_path_len]) else {
+        process_set_state(child_index, ProcessState::Failed, -1);
+        return -1;
+    };
+
+    let snapshot = app_snapshot();
+
+    // Parent and child each get their own address space for the program
+    // image window, so the child overwriting it can't disturb the parent's
+    // code or data (previously this had to snapshot the parent's ELF and
+    // reload its read-only segments afterward -- and could never restore its
+    // writable data at all, since it was never saved).
+    let Some(parent_pml4) = current_pml4_or_kernel() else {
+        app_restore(snapshot);
+        process_set_state(child_index, ProcessState::Failed, -1);
+        return -1;
+    };
+    let Some(child_pml4) = create_process_address_space(child_pid) else {
+        app_restore(snapshot);
+        process_set_state(child_index, ProcessState::Failed, -1);
+        return -1;
+    };
+
+    unsafe {
+        write_cr3(child_pml4);
+    }
+
+    let Some(entry) = load_program_elf_isolated(console, child_image, child_pml4) else {
+        unsafe {
+            write_cr3(parent_pml4);
+        }
+        destroy_process_address_space(child_pml4);
+        app_restore(snapshot);
+        process_set_state(child_index, ProcessState::Failed, -1);
+        return -1;
+    };
+
+    let code = unsafe {
+        process_set_state(child_index, ProcessState::Running, 0);
+        APP_CONSOLE = console as *mut Console;
+        APP_BOOTFS = bootfs;
+        {
+            let table = &raw const PROCESS_TABLE;
+            APP_ARGS_PTR = (*table)[child_index].args.as_ptr();
+            APP_ARGS_LEN = (*table)[child_index].args_len;
+        }
+        APP_PID = child_pid;
+        APP_PROCESS_INDEX = child_index;
+        app_set_heap_window(child_pid);
+        {
+            let table = &raw mut PROCESS_TABLE;
+            let process = &mut (*table)[child_index];
+            process.pml4_phys = child_pml4;
+            APP_STD_FDS = process.inherited_std_fds;
+            APP_CWD = process.inherited_cwd;
+            APP_CWD_LEN = process.inherited_cwd_len;
+            APP_ENV = process.inherited_env;
+        }
+
+        let program: extern "sysv64" fn(*const RymosAbi) -> i32 = core::mem::transmute(entry);
+        let code = program(&RYMOS_ABI);
+
+        // A "fire and forget" spawn this child never waited on would
+        // otherwise never run at all now that spawn() only enqueues --
+        // drain them here so every spawn still definitely executes.
+        while let Some(grandchild) = find_ready_child_of(child_pid) {
+            run_ready_task(grandchild);
+        }
+
+        let reclaimed = process_reclaim_mappings(child_index);
+        destroy_process_address_space(child_pml4);
+        {
+            let table = &raw mut PROCESS_TABLE;
+            (*table)[child_index].pml4_phys = 0;
+        }
+        app_clear_heap_window();
+        process_set_state(child_index, ProcessState::Exited, code);
+        if reclaimed > 0 {
+            console.write("heap reclaimed ");
+            console.write_usize(reclaimed);
+            console.write_line(" pages");
+        }
+        code
+    };
+
+    unsafe {
+        write_cr3(parent_pml4);
+    }
+    app_restore_after_spawn(snapshot);
+    clear_app_error();
+    code
 }
 
 extern "sysv64" fn abi_wait(pid: u32, status_ptr: *mut RymosProcessStatus) -> i32 {
     if status_ptr.is_null() {
         return -1;
     }
-    let Some(status) = process_status_by_pid(pid) else {
-        return -1;
-    };
-    unsafe {
-        status_ptr.write(status);
+    loop {
+        if let Some(status) = process_wait_by_pid(pid) {
+            unsafe {
+                status_ptr.write(status);
+            }
+            return 0;
+        }
+        let Some(index) = find_process_index_by_pid(pid) else {
+            return -1;
+        };
+        let is_ready = unsafe {
+            let table = &raw const PROCESS_TABLE;
+            matches!((*table)[index].state, ProcessState::Ready)
+        };
+        if !is_ready {
+            // Already waited on, doesn't exist, or (shouldn't happen: only
+            // one task ever executes at a time) somehow mid-run.
+            return -1;
+        }
+        run_ready_task(index);
     }
-    0
+}
+
+extern "sysv64" fn abi_wait_any(status_ptr: *mut RymosProcessStatus) -> i32 {
+    if status_ptr.is_null() {
+        return -1;
+    }
+    let parent_pid = unsafe { APP_PID };
+    loop {
+        if let Some((pid, status)) = process_wait_any_child(parent_pid) {
+            unsafe {
+                status_ptr.write(status);
+            }
+            return pid as i32;
+        }
+        let Some(index) = find_ready_child_of(parent_pid) else {
+            return -1;
+        };
+        run_ready_task(index);
+    }
 }
 
 extern "sysv64" fn abi_mem_alloc_pages(page_count: usize) -> u64 {
     if page_count == 0 || page_count > USER_HEAP_MAX_PAGES_PER_CALL {
         return 0;
     }
-    if ensure_kernel_pml4().is_none() {
+    let Some(pml4_phys) = ensure_kernel_pml4() else {
         return 0;
-    }
+    };
     let process_index = unsafe { APP_PROCESS_INDEX };
-    if !process_can_track_heap_pages(process_index, page_count) {
-        return 0;
-    }
 
     let base = unsafe {
         if APP_HEAP_BASE == 0 || APP_HEAP_NEXT == 0 || APP_HEAP_LIMIT == 0 {
@@ -3376,19 +4842,78 @@ extern "sysv64" fn abi_mem_alloc_pages(page_count: usize) -> u64 {
         base
     };
 
-    for index in 0..page_count {
-        let virt = base + index as u64 * PAGE_SIZE;
-        let Some(phys) = alloc_zeroed_page() else {
-            return 0;
-        };
-        if !map_page(virt, phys, PAGE_PRESENT | PAGE_WRITABLE) {
-            return 0;
-        }
-        if !process_track_heap_page(process_index, phys) {
-            return 0;
-        }
+    if !process_track_mapping(process_index, base, page_count) {
+        return 0;
+    }
+    if !map_user_pages(pml4_phys, base, page_count) {
+        let _ = process_untrack_mapping(process_index, base, page_count);
+        return 0;
     }
     base
+}
+
+extern "sysv64" fn abi_mem_map_pages(page_count: usize, flags: u32) -> u64 {
+    if page_count == 0 || page_count > USER_MMAP_MAX_PAGES_PER_CALL {
+        return 0;
+    }
+    if flags & !MEM_MAP_GUARD != 0 {
+        return 0;
+    }
+    let Some(pml4_phys) = ensure_kernel_pml4() else {
+        return 0;
+    };
+    let process_index = unsafe { APP_PROCESS_INDEX };
+    let guard_pages = if flags & MEM_MAP_GUARD != 0 { 2 } else { 0 };
+    let Some(total_pages) = page_count.checked_add(guard_pages) else {
+        return 0;
+    };
+
+    let mapped_base = unsafe {
+        if APP_MMAP_NEXT == 0 || APP_MMAP_LIMIT == 0 {
+            return 0;
+        }
+        let Some(bytes) = (total_pages as u64).checked_mul(PAGE_SIZE) else {
+            return 0;
+        };
+        let reservation_base = APP_MMAP_NEXT;
+        let Some(next) = APP_MMAP_NEXT.checked_add(bytes) else {
+            return 0;
+        };
+        if next > APP_MMAP_LIMIT {
+            return 0;
+        }
+        APP_MMAP_NEXT = next;
+        if flags & MEM_MAP_GUARD != 0 {
+            reservation_base + PAGE_SIZE
+        } else {
+            reservation_base
+        }
+    };
+
+    if !process_track_mapping(process_index, mapped_base, page_count) {
+        return 0;
+    }
+    if !map_user_pages(pml4_phys, mapped_base, page_count) {
+        let _ = process_untrack_mapping(process_index, mapped_base, page_count);
+        return 0;
+    }
+    mapped_base
+}
+
+extern "sysv64" fn abi_mem_unmap_pages(address: u64, page_count: usize) -> i32 {
+    if address == 0
+        || page_count == 0
+        || page_count > USER_MMAP_MAX_PAGES_PER_CALL
+        || address & (PAGE_SIZE - 1) != 0
+    {
+        return -1;
+    }
+    let process_index = unsafe { APP_PROCESS_INDEX };
+    if !process_untrack_mapping(process_index, address, page_count) {
+        return -1;
+    }
+    let _ = unmap_user_pages(unsafe { KERNEL_PML4_PHYS }, address, page_count);
+    0
 }
 
 extern "sysv64" fn abi_time_ticks() -> u64 {
@@ -3397,25 +4922,24 @@ extern "sysv64" fn abi_time_ticks() -> u64 {
 
 extern "sysv64" fn abi_unlink(path_ptr: *const u8, path_len: usize) -> i32 {
     let Some(path) = checked_app_slice(path_ptr, path_len) else {
-        return -1;
+        return set_app_error(ERR_INVAL);
     };
-    if !starts_with(path, b"pfs:") {
-        return -1;
-    }
-    let name = &path[4..];
-    if !valid_pfs_path(name) {
-        return -1;
-    }
+    let mut resolved = [0u8; PFS_NAME_MAX];
+    let Some(name_len) = pfs_resolve_path(path, &mut resolved) else {
+        return set_app_error(ERR_INVAL);
+    };
+    let name = &resolved[..name_len];
     let Some(mut header) = PersistentFs::read_header_silent() else {
-        return -1;
+        return set_app_error(ERR_IO);
     };
-    if pfs_unlink_header(&mut header, name).is_err() {
-        return -1;
+    if let Err(code) = pfs_unlink_header(&mut header, name) {
+        return set_app_error(if code == -2 { ERR_INVAL } else { ERR_NOENT });
     }
     if PersistentFs::write_header(&header) {
+        clear_app_error();
         0
     } else {
-        -1
+        set_app_error(ERR_IO)
     }
 }
 
@@ -3426,32 +4950,199 @@ extern "sysv64" fn abi_rename(
     new_len: usize,
 ) -> i32 {
     let Some(old_path) = checked_app_slice(old_ptr, old_len) else {
-        return -1;
+        return set_app_error(ERR_INVAL);
     };
     let Some(new_path) = checked_app_slice(new_ptr, new_len) else {
-        return -1;
+        return set_app_error(ERR_INVAL);
     };
-    if !starts_with(old_path, b"pfs:") || !starts_with(new_path, b"pfs:") {
-        return -1;
-    }
-    let old_name = &old_path[4..];
-    let new_name = &new_path[4..];
+    let mut old_resolved = [0u8; PFS_NAME_MAX];
+    let mut new_resolved = [0u8; PFS_NAME_MAX];
+    let Some(old_len) = pfs_resolve_path(old_path, &mut old_resolved) else {
+        return set_app_error(ERR_INVAL);
+    };
+    let Some(new_len) = pfs_resolve_path(new_path, &mut new_resolved) else {
+        return set_app_error(ERR_INVAL);
+    };
+    let old_name = &old_resolved[..old_len];
+    let new_name = &new_resolved[..new_len];
     let Some(mut header) = PersistentFs::read_header_silent() else {
-        return -1;
+        return set_app_error(ERR_IO);
     };
-    if pfs_rename_header(&mut header, old_name, new_name).is_err() {
-        return -1;
+    if let Err(code) = pfs_rename_header(&mut header, old_name, new_name) {
+        let error = match code {
+            -2 => ERR_NOENT,
+            -3 => ERR_EXIST,
+            -4 => ERR_NOENT,
+            -5 => ERR_INVAL,
+            _ => ERR_INVAL,
+        };
+        return set_app_error(error);
     }
     if PersistentFs::write_header(&header) {
+        clear_app_error();
         0
     } else {
-        -1
+        set_app_error(ERR_IO)
     }
 }
 
+extern "sysv64" fn abi_cwd(buffer_ptr: *mut u8, buffer_len: usize) -> isize {
+    let len = unsafe { APP_CWD_LEN };
+    if buffer_ptr.is_null() || buffer_len == 0 {
+        return len as isize;
+    }
+    let copy_len = min(buffer_len, len);
+    unsafe {
+        let cwd = core::ptr::addr_of!(APP_CWD);
+        copy_nonoverlapping((*cwd).as_ptr(), buffer_ptr, copy_len);
+    }
+    clear_app_error();
+    copy_len as isize
+}
+
+extern "sysv64" fn abi_chdir(path_ptr: *const u8, path_len: usize) -> i32 {
+    let Some(path) = checked_app_slice(path_ptr, path_len) else {
+        return set_app_error(ERR_INVAL);
+    };
+    if eq(path, b"/") {
+        unsafe {
+            let cwd = core::ptr::addr_of_mut!(APP_CWD);
+            (*cwd).fill(0);
+            (*cwd)[0] = b'/';
+            APP_CWD_LEN = 1;
+        }
+        clear_app_error();
+        return 0;
+    }
+    if eq(path, b"pfs:") || eq(path, b"pfs:/") {
+        unsafe {
+            let cwd = core::ptr::addr_of_mut!(APP_CWD);
+            (*cwd).fill(0);
+            (&mut (*cwd))[..4].copy_from_slice(b"pfs:");
+            APP_CWD_LEN = 4;
+        }
+        clear_app_error();
+        return 0;
+    }
+
+    let mut resolved = [0u8; PFS_NAME_MAX];
+    let Some(name_len) = pfs_resolve_path(path, &mut resolved) else {
+        return set_app_error(ERR_INVAL);
+    };
+    let name = &resolved[..name_len];
+    let Some(header) = PersistentFs::read_header_silent() else {
+        return set_app_error(ERR_IO);
+    };
+    let Some(index) = pfs_find_entry(&header, name) else {
+        return set_app_error(ERR_NOENT);
+    };
+    if !pfs_entry_is_dir(&header, index) {
+        return set_app_error(ERR_NOTDIR);
+    }
+    unsafe {
+        let cwd = core::ptr::addr_of_mut!(APP_CWD);
+        (*cwd).fill(0);
+        (&mut (*cwd))[..4].copy_from_slice(b"pfs:");
+        (&mut (*cwd))[4..4 + name_len].copy_from_slice(name);
+        APP_CWD_LEN = 4 + name_len;
+    }
+    clear_app_error();
+    0
+}
+
+extern "sysv64" fn abi_last_error() -> i32 {
+    unsafe { APP_LAST_ERROR }
+}
+
+extern "sysv64" fn abi_pipe(read_fd_ptr: *mut i32, write_fd_ptr: *mut i32) -> i32 {
+    if read_fd_ptr.is_null() || write_fd_ptr.is_null() {
+        return set_app_error(ERR_INVAL);
+    }
+
+    unsafe {
+        let pipes = core::ptr::addr_of_mut!(APP_PIPES);
+        let table = core::ptr::addr_of_mut!(APP_FDS);
+        let pipe_index = match (0..APP_PIPE_COUNT).find(|index| !(*pipes)[*index].used) {
+            Some(index) => index,
+            None => return set_app_error(ERR_NOSPC),
+        };
+
+        let mut read_slot = APP_FD_COUNT;
+        let mut write_slot = APP_FD_COUNT;
+        for index in 0..APP_FD_COUNT {
+            if !(*table)[index].open {
+                if read_slot == APP_FD_COUNT {
+                    read_slot = index;
+                } else {
+                    write_slot = index;
+                    break;
+                }
+            }
+        }
+        if write_slot == APP_FD_COUNT {
+            return set_app_error(ERR_NOSPC);
+        }
+
+        (*pipes)[pipe_index] = AppPipe {
+            used: true,
+            read_open: true,
+            write_open: true,
+            buffer: [0; APP_PIPE_BUFFER_SIZE],
+            read_offset: 0,
+            len: 0,
+        };
+        (*table)[read_slot] = AppFd {
+            open: true,
+            kind: AppFdKind::PipeRead,
+            flags: FD_READ,
+            data: core::ptr::null(),
+            len: 0,
+            offset: 0,
+            pfs_index: pipe_index,
+        };
+        (*table)[write_slot] = AppFd {
+            open: true,
+            kind: AppFdKind::PipeWrite,
+            flags: FD_WRITE,
+            data: core::ptr::null(),
+            len: 0,
+            offset: 0,
+            pfs_index: pipe_index,
+        };
+        read_fd_ptr.write(read_slot as i32 + APP_FD_BASE);
+        write_fd_ptr.write(write_slot as i32 + APP_FD_BASE);
+    }
+    clear_app_error();
+    0
+}
+
+extern "sysv64" fn abi_dup2(old_fd: i32, new_fd: i32) -> i32 {
+    if !(STDIN_FD..=STDERR_FD).contains(&new_fd) {
+        return set_app_error(ERR_INVAL);
+    }
+    if old_fd == new_fd {
+        unsafe {
+            let std_fds = core::ptr::addr_of_mut!(APP_STD_FDS);
+            (*std_fds)[new_fd as usize] = new_fd;
+        }
+        clear_app_error();
+        return new_fd;
+    }
+    if !app_fd_open(old_fd) {
+        return set_app_error(ERR_INVAL);
+    }
+    unsafe {
+        let std_fds = core::ptr::addr_of_mut!(APP_STD_FDS);
+        (*std_fds)[new_fd as usize] = old_fd;
+    }
+    clear_app_error();
+    new_fd
+}
+
 fn stat_path(path: &[u8]) -> Option<RymosStat> {
-    if starts_with(path, b"pfs:") {
-        let name = &path[4..];
+    let mut resolved = [0u8; PFS_NAME_MAX];
+    if let Some(name_len) = pfs_resolve_path(path, &mut resolved) {
+        let name = &resolved[..name_len];
         let header = PersistentFs::read_header_silent()?;
         let index = pfs_find_entry(&header, name)?;
         return Some(RymosStat {
@@ -3462,6 +5153,9 @@ fn stat_path(path: &[u8]) -> Option<RymosStat> {
             },
             fs: STAT_FS_PFS,
             size: pfs_entry_size(&header, index),
+            created_ticks: pfs_entry_created(&header, index),
+            modified_ticks: pfs_entry_modified(&header, index),
+            mode: pfs_entry_mode(&header, index) as u32,
         });
     }
 
@@ -3476,6 +5170,9 @@ fn stat_path(path: &[u8]) -> Option<RymosStat> {
             },
             fs: STAT_FS_BOOTFS,
             size: entry.data_len,
+            created_ticks: 0,
+            modified_ticks: 0,
+            mode: BOOTFS_MODE,
         })
     }
 }
@@ -3495,6 +5192,9 @@ fn list_bootfs(wanted: usize) -> Option<(&'static [u8], RymosStat)> {
                 },
                 fs: STAT_FS_BOOTFS,
                 size: entry.data_len,
+                created_ticks: 0,
+                modified_ticks: 0,
+                mode: BOOTFS_MODE,
             },
         ))
     }
@@ -3507,15 +5207,86 @@ fn app_close_all_fds() {
         for handle in table.iter_mut() {
             *handle = AppFd::empty();
         }
+        let pipes = core::ptr::addr_of_mut!(APP_PIPES);
+        let pipes = &mut *pipes;
+        for pipe in pipes.iter_mut() {
+            *pipe = AppPipe::empty();
+        }
+    }
+}
+
+fn app_snapshot() -> AppStateSnapshot {
+    unsafe {
+        AppStateSnapshot {
+            console: APP_CONSOLE,
+            bootfs: APP_BOOTFS,
+            args_ptr: APP_ARGS_PTR,
+            args_len: APP_ARGS_LEN,
+            pid: APP_PID,
+            process_index: APP_PROCESS_INDEX,
+            fds: *core::ptr::addr_of!(APP_FDS),
+            pipes: *core::ptr::addr_of!(APP_PIPES),
+            std_fds: *core::ptr::addr_of!(APP_STD_FDS),
+            cwd: *core::ptr::addr_of!(APP_CWD),
+            cwd_len: APP_CWD_LEN,
+            env: *core::ptr::addr_of!(APP_ENV),
+            last_error: APP_LAST_ERROR,
+            heap_base: APP_HEAP_BASE,
+            heap_next: APP_HEAP_NEXT,
+            heap_limit: APP_HEAP_LIMIT,
+            mmap_next: APP_MMAP_NEXT,
+            mmap_limit: APP_MMAP_LIMIT,
+        }
+    }
+}
+
+fn app_restore(snapshot: AppStateSnapshot) {
+    unsafe {
+        APP_CONSOLE = snapshot.console;
+        APP_BOOTFS = snapshot.bootfs;
+        APP_ARGS_PTR = snapshot.args_ptr;
+        APP_ARGS_LEN = snapshot.args_len;
+        APP_PID = snapshot.pid;
+        APP_PROCESS_INDEX = snapshot.process_index;
+        *core::ptr::addr_of_mut!(APP_FDS) = snapshot.fds;
+        *core::ptr::addr_of_mut!(APP_PIPES) = snapshot.pipes;
+        *core::ptr::addr_of_mut!(APP_STD_FDS) = snapshot.std_fds;
+        *core::ptr::addr_of_mut!(APP_CWD) = snapshot.cwd;
+        APP_CWD_LEN = snapshot.cwd_len;
+        *core::ptr::addr_of_mut!(APP_ENV) = snapshot.env;
+        APP_LAST_ERROR = snapshot.last_error;
+        APP_HEAP_BASE = snapshot.heap_base;
+        APP_HEAP_NEXT = snapshot.heap_next;
+        APP_HEAP_LIMIT = snapshot.heap_limit;
+        APP_MMAP_NEXT = snapshot.mmap_next;
+        APP_MMAP_LIMIT = snapshot.mmap_limit;
+    }
+}
+
+fn app_restore_after_spawn(snapshot: AppStateSnapshot) {
+    let child_pipes = unsafe { *core::ptr::addr_of!(APP_PIPES) };
+    app_restore(snapshot);
+    unsafe {
+        let pipes = core::ptr::addr_of_mut!(APP_PIPES);
+        for index in 0..APP_PIPE_COUNT {
+            if snapshot.pipes[index].used {
+                (*pipes)[index].buffer = child_pipes[index].buffer;
+                (*pipes)[index].read_offset = child_pipes[index].read_offset;
+                (*pipes)[index].len = child_pipes[index].len;
+            }
+        }
     }
 }
 
 fn app_set_heap_window(pid: u32) {
     unsafe {
         let base = USER_HEAP_BASE + pid as u64 * USER_HEAP_STRIDE;
+        let mmap_base = USER_MMAP_BASE + pid as u64 * USER_MMAP_STRIDE;
         APP_HEAP_BASE = base;
         APP_HEAP_NEXT = base;
         APP_HEAP_LIMIT = base + USER_HEAP_STRIDE;
+        APP_MMAP_NEXT = mmap_base;
+        APP_MMAP_LIMIT = mmap_base + USER_MMAP_SIZE;
         if APP_PROCESS_INDEX < PROCESS_COUNT {
             let table = &raw mut PROCESS_TABLE;
             (*table)[APP_PROCESS_INDEX].heap_base = base;
@@ -3528,6 +5299,8 @@ fn app_clear_heap_window() {
         APP_HEAP_BASE = 0;
         APP_HEAP_NEXT = 0;
         APP_HEAP_LIMIT = 0;
+        APP_MMAP_NEXT = 0;
+        APP_MMAP_LIMIT = 0;
     }
 }
 
@@ -3582,12 +5355,12 @@ fn run_program(console: &mut Console, bootfs: BootFs, name: &[u8], args: &[u8]) 
     let path_len = program_path(name, &mut path);
     let Some(image) = bootfs.find_data(&path[..path_len]) else {
         console.write_line("run: program not found");
-        process_set_state(process_index, ProcessState::Failed, -1);
+        process_fail_unwaited(process_index);
         return;
     };
 
     let Some(entry) = load_program_elf(console, image) else {
-        process_set_state(process_index, ProcessState::Failed, -1);
+        process_fail_unwaited(process_index);
         return;
     };
 
@@ -3607,11 +5380,24 @@ fn run_program(console: &mut Console, bootfs: BootFs, name: &[u8], args: &[u8]) 
         APP_PROCESS_INDEX = process_index;
         app_set_heap_window(APP_PID);
         app_close_all_fds();
+        reset_app_std_fds();
         app_reset_path_state();
         let program: extern "sysv64" fn(*const RymosAbi) -> i32 = core::mem::transmute(entry);
         let code = program(&RYMOS_ABI);
+
+        // Defense in depth, matching `run_ready_task`: a top-level `run`'d
+        // program can spawn children via the ABI too. Nothing should ever
+        // actually be `Ready` here under today's eager spawn (see
+        // `spawn_prepared`'s docs), but if that ever changes, this is where
+        // anything it never waited on would need to run before this process
+        // itself finishes.
+        while let Some(pending) = find_ready_child_of(APP_PID) {
+            run_ready_task(pending);
+        }
+
         app_close_all_fds();
-        let reclaimed = process_reclaim_heap_pages(process_index);
+        reset_app_std_fds();
+        let reclaimed = process_reclaim_mappings(process_index);
         app_clear_heap_window();
         APP_CONSOLE = core::ptr::null_mut();
         APP_BOOTFS = BootFs::empty();
@@ -3621,6 +5407,13 @@ fn run_program(console: &mut Console, bootfs: BootFs, name: &[u8], args: &[u8]) 
         APP_PROCESS_INDEX = PROCESS_COUNT;
         app_reset_path_state();
         process_set_state(process_index, ProcessState::Exited, code);
+        // Same reasoning as `process_fail_unwaited`: nobody will ever call
+        // `wait`/`wait_any` on a top-level `run`'d process, so it must not
+        // become an unreapable zombie.
+        {
+            let table = &raw mut PROCESS_TABLE;
+            (*table)[process_index].waited = true;
+        }
         if reclaimed > 0 {
             console.write("heap reclaimed ");
             console.write_usize(reclaimed);
@@ -3653,6 +5446,10 @@ fn program_path<'a>(name: &[u8], output: &'a mut [u8; 32]) -> usize {
 }
 
 fn load_program_elf(console: &mut Console, elf: &[u8]) -> Option<u64> {
+    load_program_elf_segments(console, elf)
+}
+
+fn load_program_elf_segments(console: &mut Console, elf: &[u8]) -> Option<u64> {
     if elf.len() < core::mem::size_of::<Elf64Header>() {
         console.write_line("run: bad elf header");
         return None;
@@ -3690,6 +5487,88 @@ fn load_program_elf(console: &mut Console, elf: &[u8]) -> Option<u64> {
         }
         if ph.paddr < APP_LOAD_MIN || ph.paddr + ph.memsz > APP_LOAD_MAX {
             console.write_line("run: segment outside app area");
+            return None;
+        }
+
+        let destination = ph.paddr as *mut u8;
+        unsafe {
+            zero_bytes(destination, ph.memsz as usize);
+            copy_nonoverlapping(
+                elf.as_ptr().add(ph.offset as usize),
+                destination,
+                ph.filesz as usize,
+            );
+        }
+    }
+
+    Some(header.entry)
+}
+
+/// Like `load_program_elf_segments`, but for a process with its own private
+/// address space (see `create_process_address_space`): instead of assuming
+/// the fixed program-image window is already accessible (identity-mapped),
+/// this maps fresh physical pages for every `PT_LOAD` segment into the given
+/// PML4.
+///
+/// Deliberately does *not* use `process_track_mapping`/`process_reclaim_mappings`:
+/// those always unmap against the shared `KERNEL_PML4_PHYS` (that's correct
+/// for heap/mmap, which really do live there), but these segment pages live
+/// in the process's *private* PML4 instead. Using the wrong PML4 to unmap
+/// them wouldn't just fail quietly -- physical pages below `APP_LOAD_MAX`
+/// aren't part of any `PHYS_ALLOCATOR` range, and `free_page` doesn't
+/// validate that, so it would push a firmware-owned address onto the
+/// allocator's free list. `destroy_process_address_space` reclaims these
+/// pages correctly instead, by walking the private PD it already owns.
+///
+/// The caller must already have `pml4_phys` active in CR3 -- segment bytes
+/// are written through the mapped virtual addresses directly.
+fn load_program_elf_isolated(console: &mut Console, elf: &[u8], pml4_phys: u64) -> Option<u64> {
+    if elf.len() < core::mem::size_of::<Elf64Header>() {
+        console.write_line("run: bad elf header");
+        return None;
+    }
+
+    let header = unsafe { &*(elf.as_ptr().cast::<Elf64Header>()) };
+    if &header.ident[0..4] != ELF_MAGIC || header.ident[4] != 2 || header.machine != 0x3E {
+        console.write_line("run: unsupported elf");
+        return None;
+    }
+
+    let phoff = header.phoff as usize;
+    let phentsize = header.phentsize as usize;
+    let phnum = header.phnum as usize;
+    if phentsize < core::mem::size_of::<Elf64ProgramHeader>()
+        || phoff + phentsize * phnum > elf.len()
+    {
+        console.write_line("run: bad program headers");
+        return None;
+    }
+
+    for index in 0..phnum {
+        let ph = unsafe {
+            &*(elf
+                .as_ptr()
+                .add(phoff + index * phentsize)
+                .cast::<Elf64ProgramHeader>())
+        };
+        if ph.typ != PT_LOAD || ph.memsz == 0 {
+            continue;
+        }
+        if ph.offset as usize + ph.filesz as usize > elf.len() || ph.filesz > ph.memsz {
+            console.write_line("run: bad load segment");
+            return None;
+        }
+        if ph.paddr < APP_LOAD_MIN || ph.paddr + ph.memsz > APP_LOAD_MAX {
+            console.write_line("run: segment outside app area");
+            return None;
+        }
+
+        let page_start = ph.paddr & !(PAGE_SIZE - 1);
+        let page_end = (ph.paddr + ph.memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let page_count = ((page_end - page_start) / PAGE_SIZE) as usize;
+
+        if !map_image_pages(pml4_phys, page_start, page_count) {
+            console.write_line("run: segment map failed");
             return None;
         }
 

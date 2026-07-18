@@ -6,52 +6,52 @@ goal = "Run a Rust toolchain on RYMOS after the OS grows enough POSIX-like runti
 [[requirement]]
 name = "Program ABI"
 status = "partial"
-detail = "ELF programs run synchronously in trusted kernel mode with ABI v10, descriptor IO, stdio fds, stat, listing, mkdir, unlink, rename, environment reads, process status, heap page allocation, and monotonic ticks."
+detail = "ELF programs run synchronously in trusted kernel mode with ABI v21, argv-preserving spawn_argv, argv-style reads, process-local environment overrides, parent/child tracking, consuming wait/wait_any status, synchronous spawn with inherited std fds, pipe-fed child stdin, separate stdout/stderr capture, descriptor IO, stdio fds, pipes, dup2 redirection, stat, listing, mkdir, unlink, rename, cwd/path resolution, errno-style last_error, environment reads, process status, heap and mmap-style page allocation, and monotonic ticks. stat/list now also report created/modified tick timestamps and a permission-style mode byte."
 
 [[requirement]]
 name = "Core Runtime"
 status = "partial"
-detail = "rymos-user exposes console, args, pid, line input, and read-only BootFS reads."
+detail = "rymos-user exposes console, raw args, argv reads, mutable env wrappers, pid, line input, read-only BootFS reads, and a stdish compatibility shim for fs/env/process/io/time/path/temp-dir/error basics."
 
 [[requirement]]
 name = "Persistent Filesystem"
 status = "partial"
-detail = "RYMFS3 persists 256 MiB files in contiguous dynamic extents with 96 entries and compact nested directories with unlink/rename, but rustc still needs richer directory behavior and non-contiguous allocation."
+detail = "RYMFS5 persists 256 MiB files across up to 4 non-contiguous extents per file, 256 entries with 96-byte names, compact nested directories, unlink/rename, append/create-new open modes, OpenOptions-style runtime wrappers, per-entry created/modified tick timestamps plus a permission-style mode byte, and sparse writes (seeking past the current end and writing zero-fills the gap instead of leaving stale disk contents). Growth coalesces into the last extent when the newly-found free run is physically contiguous with it, so ordinary sequential writes don't burn through the 4-extent budget on nothing but adjacent sectors. Verified live in QEMU: a file too big to fit in a single freed hole between two other files split cleanly across two extents and read back byte-exact; a path well past the old 30-byte limit, a sparse write with a zero-filled gap, and 20 concurrent open file descriptors all round-tripped correctly. Still open: the 256-entry/96-byte-name ceilings are fixed compile-time limits, not true unbounded growth -- that would mean moving the entry table itself onto growable disk extents (the header is read into a stack-local buffer in a few places today, which is the actual limiter on how far a fixed bump can safely go)."
 
 [[requirement]]
 name = "Process Model"
 status = "partial"
-detail = "PIDs, exit status, and ABI wait/status exist; spawn is blocked until app loading can isolate or relocate child programs."
+detail = "PIDs, parent PID tracking, exit status, consuming ABI wait/wait_any, and synchronous spawn with inherited std fds exist. Spawned children now run in their own isolated address space (see Memory Management), which removed the old fixed-address snapshot/restore-ELF dance and fixed a real bug where a child's execution silently corrupted the parent's writable globals. A real reaping bug is now fixed: a brand-new spawn used to silently reuse any Exited/Failed process-table slot regardless of whether its real parent had ever called wait/wait_any on it, destroying a genuine child's exit status before it was ever collected; slot reuse now requires the zombie to already be waited on (process_find_reapable_slot), and top-level console `run`'d processes (which have no ABI parent to wait on them) are marked pre-reaped so they don't become permanent zombies. Concurrent (actually parallel/interleaved) children still need a real scheduler: there is still no saved per-process CPU register/stack context and no preemption, so execution is still a synchronous nested call -- isolation means a child can no longer corrupt its parent's memory, not that parent and child run at the same time. A genuinely deferred/queued spawn (enqueue at spawn time, actually run later when something waits) was attempted and reverted after it broke live in QEMU: several of rysh's own shell built-ins, and rymos-user's Command helpers, redirect stdio/cwd/env, spawn, and read the result with no intervening wait() call at all, relying entirely on spawn's synchronous completion -- deferring it left a redirected pipe disconnected from ever being read. Fixing every affected caller is a separate, large audit, not a bounded slice of this milestone."
 
 [[requirement]]
 name = "Memory Management"
 status = "partial"
-detail = "UEFI memory map, physical page allocation, kernel-owned PML4, virtual mappings, per-process heap windows, and heap unmap/reclaim exist; rustc still needs mmap-like behavior, page-table reclaim, and larger address spaces."
+detail = "UEFI memory map, physical page allocation, kernel-owned PML4, virtual mappings, per-process heap windows, guarded mmap-like map/unmap regions, and process-exit unmap/reclaim exist. Spawned children now get their own private PML4 for the fixed program-image window (0x200000-0x9000000): a shallow top-level PML4 clone plus selectively-privatized PDPT/PD entries just for that range, so the kernel's own mappings and every process's heap/mmap windows stay shared while each process's code/data is genuinely isolated. destroy_process_address_space reclaims the private PT/PD/PDPT/PML4 structural pages plus any data pages still mapped there, so this doesn't leak a page-table page per spawn. Still open: relocatable/PIE loading (every process still uses the same virtual address for its image, just backed by different physical pages -- this is isolation via separate tables, not relocation), and the older, more general page-table-page reclaim gap for the shared heap/mmap windows (their PT pages, unlike the new private image-window ones, are still never freed on process exit)."
 
 [[requirement]]
 name = "File Descriptor ABI"
 status = "partial"
-detail = "BootFS read handles, RYMFS3 read/write/seek handles, stat, listing, compact nested mkdir, unlink, rename, 96 entries, and 256 MiB files exist."
+detail = "BootFS read handles, RYMFS5 read/write/append/seek handles, stat, listing, compact nested mkdir, unlink, rename, 256 entries, 256 MiB files, per-entry timestamps/mode, non-contiguous (up to 4 extents) allocation per file, sparse writes, and up to 32 concurrent per-process file descriptors (raised from 8) exist."
 
 [[requirement]]
 name = "Toolchain Target"
 status = "partial"
-detail = "x86_64-rymos.json exists; custom target builds need nightly/rust-src today."
+detail = "x86_64-rymos.json now parses on current nightly (target-pointer-width/target-c-int-width as integers, explicit rustc-abi=softfloat, max-atomic-width, and singlethread=true) and RYMOS_TARGET_MODE=custom plus nightly rust-src builds real programs end to end via `-Z build-std -Z json-target-spec`. A forked rust-lang/rust checkout also lives at toolchain/rust (git submodule) with a patched library/std for real std support; see the libstd entry."
 
 [[requirement]]
 name = "libcore"
-status = "planned"
-detail = "Build core and compiler_builtins for x86_64-rymos."
+status = "partial"
+detail = "core, alloc, and compiler_builtins now build and link for x86_64-rymos via nightly build-std; verified end to end by building and installing the hello program through scripts/rymos-sdk.py's custom target mode."
 
 [[requirement]]
 name = "liballoc"
 status = "partial"
-detail = "rymos-user grows a bump heap through kernel-mapped pages and can run Vec/String smoke tests in per-process virtual windows; heap data pages are unmapped and reclaimed on process exit."
+detail = "rymos-user grows a bump heap through kernel-mapped pages, exposes guarded mmap-like regions, and can run Vec/String smoke tests in per-process virtual windows; mapped data pages are unmapped and reclaimed on process exit."
 
 [[requirement]]
 name = "libstd"
-status = "planned"
-detail = "Requires more RYMOS implementations for safe process spawning, calibrated time, networking stubs, and synchronization; read-only env and raw tick support have started."
+status = "partial"
+detail = "A real std program now boots and runs on x86_64-rymos: toolchain/rust (a forked rust-lang/rust checkout, built locally via ./x.py build library/std --stage 1) adds sys::pal::rymos with a real _start(abi) -> i32 entry that stores the ABI pointer and calls the compiler-generated main() from #[lang = \"start\"] (same pattern as Hermit's runtime_entry), a real bump allocator in sys::alloc::rymos over mem_alloc_pages, and real Stdout/Stderr writes through the ABI console call in sys::stdio::rymos. Reuses the existing no_threads TLS/sync fallbacks, the random::unsupported fallback (panics), and the io::error::generic fallback (no real errno mapping); target spec sets singlethread=true to match. Verified live in QEMU: a `#![feature(restricted_std)]` binary using println!, Vec, and iterators printed correct output and exited cleanly with heap reclaimed. Found and fixed along the way: the bootloader's hardcoded 4 MiB INITRD_READ_LIMIT silently truncated bootfs once a debug std binary's size exceeded it (raised to 32 MiB). Still open: sys::fs, sys::env, sys::process, sys::time are unwired stubs; a no_std stdish shim still covers early fs/env/process/io/time/path/temp-dir/error basics for no_std programs."
 
 [[requirement]]
 name = "Rust Compiler"

@@ -270,7 +270,14 @@ def cargo_is_nightly() -> bool:
 def build_command(app: dict[str, str], mode: str) -> list[str]:
     command = ["cargo"]
     if mode == "custom":
-        command += ["-Z", "build-std=core,compiler_builtins"]
+        command += [
+            "-Z",
+            "build-std=core,alloc,compiler_builtins",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "-Z",
+            "json-target-spec",
+        ]
     command += ["build", "-p", app["package"], "--release", "--target", target_arg(mode)]
     return command
 

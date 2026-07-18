@@ -18,6 +18,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "rymos-program-cmdapi"
+version = "0.1.0"
+dependencies = [
+ "rymos-user",
+]
+
+[[package]]
+name = "rymos-program-echoin"
+version = "0.1.0"
+dependencies = [
+ "rymos-user",
+]
+
+[[package]]
+name = "rymos-program-fswalk"
+version = "0.1.0"
+dependencies = [
+ "rymos-user",
+]
+
+[[package]]
+name = "rymos-program-heapstress"
+version = "0.1.0"
+dependencies = [
+ "rymos-user",
+]
+
+[[package]]
 name = "rymos-program-hello"
 version = "0.1.0"
 dependencies = [
@@ -26,6 +54,13 @@ dependencies = [
 
 [[package]]
 name = "rymos-program-rysh"
+version = "0.1.0"
+dependencies = [
+ "rymos-user",
+]
+
+[[package]]
+name = "rymos-program-stdshim"
 version = "0.1.0"
 dependencies = [
  "rymos-user",

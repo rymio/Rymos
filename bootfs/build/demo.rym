@@ -7,8 +7,33 @@ print $greeting
 env
 getenv RYMOS_TARGET
 getenv PATH
+setenv RYMOS_BUILD_MODE debug
+getenv RYMOS_BUILD_MODE
+env
+unsetenv RYMOS_BUILD_MODE
+getenv RYMOS_BUILD_MODE
 time
 stdio
+pipe hello-through-pipe
+redir captured-stdout
+spawn hello readme.txt
+wait
+spawnredir hello readme.txt
+wait
+spawnstdin echoin hello-child-stdin
+wait
+spawnio echoin roundtrip-stdin
+wait
+spawnioe echoin split-streams
+wait
+spawn cmdapi
+wait
+spawn fswalk
+wait
+spawn heapstress
+wait
+spawn stdshim
+wait
 wait 1
 cat build/packages.txt
 cat build/selfhost.txt

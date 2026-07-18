@@ -2,6 +2,8 @@
 
 RYMOS is a Rust-based operating system experiment.
 
+RYMOS is early but on the right route -- not usable yet.
+
 The current milestone follows the shape of Philipp Oppermann's minimal Rust
 kernel chapter:
 
@@ -95,11 +97,16 @@ target/rymos-data.img
 RYMFS is intentionally small:
 
 - raw ATA disk, primary slave in QEMU
-- RYMFS3 metadata header
-- 96 entries max
+- RYMFS5 metadata header
+- 256 entries max, 96-byte names (a fixed ceiling, not unbounded growth)
 - 256 MiB max per file
-- contiguous dynamic extents inside the 4 GiB data disk
+- non-contiguous allocation: up to 4 extents per file inside the 4 GiB data
+  disk, so fragmentation from other files doesn't cause spurious "disk full"
+- sparse writes: seeking past the current end and writing there zero-fills
+  the gap instead of leaving stale disk contents
 - compact nested paths, directories, rename, and delete
+- read/write/create/truncate/append/create-new open modes
+- created/modified tick timestamps and a permission-style mode byte per entry
 - persistent across emulator restarts
 
 Commands:
@@ -117,6 +124,23 @@ To upload a host file into the persistent disk image:
 
 ```sh
 make pfs-put UPLOAD_FILE=/path/to/file.bin UPLOAD_DEST=uploads/file.bin
+```
+
+## Rust Programs
+
+BootFS packages several Rust-first `no_std` programs:
+
+```text
+programs/hello/        ABI and BootFS smoke test
+programs/rysh/         Tiny command/script runner
+programs/allocdemo/    Heap allocation and reclaim test
+programs/echoin/       Child stdin/stdout/stderr test helper
+programs/cmdapi/       Runtime Command output smoke test, plus a
+                       parent-globals-survive-spawn regression check
+programs/fswalk/       RYMFS5 filesystem smoke test (mkdir, write, append,
+                       rename, stat, list)
+programs/heapstress/   mmap/heap pressure and guarded-region smoke test
+programs/stdshim/      std-shaped runtime shim smoke test
 ```
 
 The data disk image is sparse by default and grows logically to 4 GiB.
@@ -156,7 +180,7 @@ RYMOS can now run a tiny Rust `no_std` program from BootFS:
 run hello
 ```
 
-Programs are ELF64 binaries linked at `0x200000` and called with ABI v10:
+Programs are ELF64 binaries linked at `0x200000` and called with ABI v21:
 
 ```rust
 extern "sysv64" fn _start(abi: *const RymosAbi) -> i32
@@ -169,12 +193,17 @@ programs now implement `rymos_main()` and call runtime helpers such as
 
 For details, see `docs/program-abi.md`.
 
-ABI v10 currently supports console output, raw args, blocking line input,
-read-only BootFS file reads, BootFS read handles, RYMFS read/write/seek
-handles, file metadata/listing, compact nested RYMFS directories, RYMFS
-unlink/rename, read-only environment variables, process wait/status, a guarded
-spawn slot, kernel-backed heap page allocation, standard descriptors,
-monotonic ticks, and exit codes by return value.
+ABI v21 currently supports console output, raw args, argv-preserving spawn,
+argv-style reads, blocking line input, read-only BootFS file reads, BootFS
+read handles, RYMFS5 read/write/seek handles, file metadata/listing (with
+created/modified tick timestamps and a permission-style mode byte), compact
+nested RYMFS directories, RYMFS unlink/rename, process-local environment
+overrides, synchronous spawn/wait status, kernel-backed heap page allocation,
+standard descriptors, monotonic ticks, cwd/path resolution, errno-style
+`last_error`, process-local pipes, std fd redirection/inheritance, and exit
+codes by return value. Spawned children now run in their own isolated
+address space instead of the shared fixed-address window earlier milestones
+used (see `docs/self-hosting.md`).
 
 ## SDK And Packages
 
@@ -208,8 +237,9 @@ run rysh build/demo.rym
 
 The first language supports comments, `print`, `write`, `pid`, `args`, `set`,
 `get`, `cat`, `writefile`, `fillfile`, `countfile`, `stat`, `listdir`,
-`mkdir`, `rm`, `rename`, `env`, `getenv`, `spawn`, `wait`, and simple
-`$variable` expansion. See `docs/rysh.md`.
+`mkdir`, `rm`, `rename`, `pwd`, `cd`, `errno`, `pipe`, `redir`, `spawnredir`,
+`spawnstdin`, `spawnio`, `spawnioe`, `env`, `getenv`, `spawn`, `wait`, and
+simple `$variable` expansion. See `docs/rysh.md`.
 
 ## Rust Self-Hosting
 
@@ -230,29 +260,41 @@ make selfhost-status
 
 The `rysh` boot demo prints the report. See `docs/self-hosting.md`.
 
-The runtime now includes a fixed 128 MiB per-program bump heap, and
+The runtime gives each process its own 256 MiB windowed bump heap, and
 `programs/allocdemo` verifies `alloc::vec::Vec` and `alloc::string::String`
-inside RYMOS.
+inside RYMOS. A forked `rustc` toolchain also lives at `toolchain/rust` (git
+submodule) with real `std` support for `x86_64-rymos` -- a genuine
+`std`-linked binary (`println!`, `Vec`, iterators) boots and runs today. See
+`docs/self-hosting.md` for exactly what's real vs. still stubbed, and
+`docs/dev-environment.md` for the full build-from-scratch steps.
 
 ## Process Model
 
-Milestone 3 adds the first process table.
+Milestone 3 adds the first process table; later milestones add real spawn
+and per-process address space isolation.
 
 Current behavior:
 
-- every `run <program>` gets a PID
+- every `run <program>` or `spawn` gets a PID
 - process state is tracked as `ready`, `running`, `exited`, or `failed`
 - exit code is stored
 - `ps` lists process history
-- `wait <pid>` reports the stored exit status
-- programs can ask for their PID through the ABI
-- programs can query process status through the ABI
-- the spawn ABI exists, but returns `-2` until app loading no longer overwrites
-  the caller
+- `wait <pid>`/`wait_any` reports exit status, including from the ABI
+- programs can ask for their PID and query process status through the ABI
+- spawn works and runs the child to completion; each child gets its own
+  private page tables for the fixed program-image window, so it can no
+  longer corrupt the parent's memory the way earlier milestones could
+  (parent and child no longer share the same backing pages, just the same
+  virtual address)
+- a zombie's process-table slot can't be reused until its real parent has
+  actually collected its exit status via `wait`/`wait_any` (previously a new
+  spawn could silently reuse an unwaited zombie's slot and destroy it)
 
-Processes still run synchronously and in trusted kernel mode. This is the
-process model foundation before scheduling, memory isolation, and ring-3
-syscalls.
+Processes still run synchronously (a spawn is a nested call, not a real
+context switch) and in trusted kernel mode. Address-space isolation is done;
+real concurrency (a scheduler, saved per-process CPU/stack context,
+preemption) and ring-3 syscalls are still ahead. See `docs/self-hosting.md`
+for the detailed status.
 
 ## Hardware Status
 
@@ -264,8 +306,9 @@ Current:
 - UEFI GOP framebuffer output at `1024x768`.
 - PCI config-space scanner.
 - UEFI memory-map reader and physical page allocator.
-- Paging diagnostics, kernel-owned PML4 clone, zeroed page-table page allocation,
-  and scratch virtual mapping.
+- Paging diagnostics, kernel-owned PML4 clone, zeroed page-table page
+  allocation, scratch virtual mapping, and per-process private PML4/PDPT/PD
+  structures isolating each spawned child's program image.
 - Volatile RAMFS.
 - Read-only bootfs initrd.
 - Persistent RYMFS over ATA PIO in QEMU.
@@ -293,6 +336,10 @@ Optional, for emulation:
 ```sh
 brew install qemu
 ```
+
+For a full fresh-machine checklist (build prerequisites, the experimental
+custom-target/`build-std` path, and rebuilding the forked `rustc` toolchain
+for real `std` support), see `docs/dev-environment.md`.
 
 ## Build
 
@@ -335,18 +382,28 @@ make run OVMF_CODE=/path/to/OVMF_CODE.fd
 ## Layout
 
 ```text
+LICENSE                      MIT license
 bootloader/src/main.rs       UEFI FAT32 ELF loader
 kernel/src/main.rs           Minimal freestanding Rust kernel
 kernel/linker.ld             Links the kernel at 1 MiB
 runtime/rymos-user/          Core runtime crate for RYMOS programs
 programs/hello/              Example Rust RYMOS program
 programs/allocdemo/          User-program heap and liballoc smoke test
+programs/echoin/             User-program stdin inheritance smoke test
+programs/cmdapi/             Command API and parent-globals-survive-spawn test
+programs/fswalk/             RYMFS5 filesystem smoke test
+programs/heapstress/         mmap/heap pressure smoke test
+programs/stdshim/            std-shaped runtime shim smoke test
 programs/rysh/               Tiny RYMOS script interpreter
 targets/x86_64-rymos.json    Canonical custom target spec for programs
+toolchain/rust/              Forked rust-lang/rust (submodule) with real
+                             std support for x86_64-rymos
 scripts/rymos-sdk.py         Program build/install wrapper
 rymos-packages.toml          Base program package manifest
 rymos-selfhost.toml          Rust compiler readiness manifest
 docs/rust-port-roadmap.md    Cargo/rustc port readiness plan
+docs/self-hosting.md         Self-hosting status: what's real vs. stubbed
+docs/dev-environment.md      Fresh-machine setup and manual rebuild steps
 bootfs/                      Files packaged into INITRD.RFS
 scripts/make_initrd.py       Read-only boot filesystem builder
 scripts/make_fat32.py        FAT32 image builder
@@ -368,3 +425,9 @@ started by adapting MOROS-style shell verbs, pseudo-device thinking, and a
 small PCI config-space scanner. Larger MOROS subsystems like ATA, networking,
 sound, and the custom filesystem need RYMOS milestones first: interrupts,
 paging, block devices, and a mounted filesystem.
+
+## License
+
+RYMOS is licensed under the [MIT License](LICENSE).
+
+`vendor/moros` is a vendored reference copy of [MOROS](https://github.com/vinc/moros), also MIT-licensed, under its own `LICENSE` file.

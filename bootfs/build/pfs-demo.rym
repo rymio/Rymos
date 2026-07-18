@@ -11,6 +11,14 @@ stat pfs:src
 stat pfs:src/main.rs
 stat pfs:src/bin
 stat pfs:src/bin/app.rs
+pwd
+cd pfs:src
+pwd
+writefile relative.txt cwd-write
+stat relative.txt
+cat relative.txt
+listdir .
+cd /
 rename pfs:src/bin/app.rs pfs:src/bin/renamed.rs
 stat pfs:src/bin/renamed.rs
 cat pfs:src/bin/renamed.rs
