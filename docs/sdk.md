@@ -21,9 +21,11 @@ It defines the intended RYMOS program ABI:
 - red zone disabled
 - linked at `0x200000` with `kernel/linker.ld`
 
-Cargo currently requires nightly plus `rust-src` for JSON target specs. The SDK
-therefore defaults to a stable-compatible fallback target,
-`x86_64-unknown-none`, while passing the same linker contract.
+Cargo currently requires nightly plus `rust-src` and `-Z build-std -Z
+json-target-spec` for JSON target specs. The SDK therefore defaults to a
+stable-compatible fallback target, `x86_64-unknown-none`, while passing the
+same linker contract. See `docs/dev-environment.md` for the exact setup
+steps.
 
 To force the custom JSON target later:
 

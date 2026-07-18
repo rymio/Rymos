@@ -44,14 +44,29 @@ mkdir <pfs:dir>   create a persistent directory
 rm <path>         remove a persistent file or empty directory
 rename <old> <new>
                   rename a persistent file or empty directory
+pwd               print the program current directory
+cd <path>         change cwd to /, pfs:, or a persistent directory
+errno             print the last ABI error code
+pipe [text]       write/read a process-local pipe
+redir [text]      redirect stdout into a pipe and read it back
+spawnredir <name> [args]
+                  spawn with stdout captured through a pipe
+spawnstdin <name> [text]
+                  spawn with stdin fed through a pipe
+spawnio <name> [text]
+                  spawn with stdin fed and stdout captured through pipes
+spawnioe <name> [text]
+                  spawn with stdin fed and stdout/stderr captured separately
 fillfile <path> <bytes>
                   write a repeated A-Z pattern
 countfile <path>  count bytes by reading to EOF
 env               list environment variables
 getenv <key>      print one environment variable
+setenv <key> <v>  set a process-local environment variable
+unsetenv <key>    remove or mask an environment variable
 spawn <name> [args]
                   request a child process launch
-wait <pid>        print process status from the ABI
+wait [pid]        wait for a child status, or a specific exited PID
 ```
 
 `print` and `write` expand variables:
