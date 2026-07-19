@@ -18,6 +18,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rymos-program-bigoutput"
+version = "0.1.0"
+dependencies = [
+ "rymos-user",
+]
+
+[[package]]
+name = "rymos-program-cargolike"
+version = "0.1.0"
+
+[[package]]
 name = "rymos-program-cmdapi"
 version = "0.1.0"
 dependencies = [
@@ -54,6 +65,13 @@ dependencies = [
 
 [[package]]
 name = "rymos-program-hello"
+version = "0.1.0"
+dependencies = [
+ "rymos-user",
+]
+
+[[package]]
+name = "rymos-program-relay"
 version = "0.1.0"
 dependencies = [
  "rymos-user",

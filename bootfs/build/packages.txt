@@ -9,3 +9,5 @@ faultcheck rymos-program-faultcheck faultcheck bootfs/programs/faultcheck.elf
 fswalk rymos-program-fswalk fswalk bootfs/programs/fswalk.elf
 heapstress rymos-program-heapstress heapstress bootfs/programs/heapstress.elf
 stdshim rymos-program-stdshim stdshim bootfs/programs/stdshim.elf
+bigoutput rymos-program-bigoutput bigoutput bootfs/programs/bigoutput.elf
+relay rymos-program-relay relay bootfs/programs/relay.elf

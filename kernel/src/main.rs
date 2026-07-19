@@ -35,13 +35,29 @@ const PROCESS_HEAP_PAGE_MAX: usize = 1024;
 const PROCESS_MAPPING_MAX: usize = 64;
 const APP_CWD_MAX: usize = 64;
 const ENV_COUNT: usize = 6;
-const APP_ENV_COUNT: usize = 8;
+const APP_ENV_COUNT: usize = 64;
 const APP_ENV_KEY_MAX: usize = 24;
 const APP_ENV_VALUE_MAX: usize = 96;
 const APP_FD_COUNT: usize = 32;
 const APP_FD_BASE: i32 = 3;
-const APP_PIPE_COUNT: usize = 4;
-const APP_PIPE_BUFFER_SIZE: usize = 1024;
+// Each `Command::output()`/`.status()` call holds 3 pipe slots (stdin,
+// stdout, stderr) open for its *entire* duration -- including however long
+// any child it spawns takes, since spawn runs synchronously to completion.
+// A nested `Command` chain (e.g. cargo -> rustc -> linker) therefore needs
+// 3 slots *per link still blocked*, not just 3 total: a realistic chain is
+// already 2-3 links by the time the innermost one runs. 12 comfortably
+// covers that with headroom, without growing each `AppStateSnapshot`'s
+// embedded pipes array (and therefore the kernel stack cost of every nested
+// spawn level -- see `AppStateSnapshot`) enough to risk much deeper chains.
+// (A previously-suspected second bug here -- nested redirection silently
+// losing data or hanging once enough slots existed for a chain to actually
+// proceed -- turned out to be a real but separate bug in `dup2`-based stdio
+// restore, not in this pipe table; see `abi_std_fd`'s docs and
+// `docs/self-hosting.md`'s Recently Closed. Fixing that is what actually
+// unblocked raising this.) Deeper nesting still hits this ceiling with a
+// clean `ERR_NOSPC`, not a crash.
+const APP_PIPE_COUNT: usize = 12;
+const APP_PIPE_BUFFER_SIZE: usize = 8192;
 const STDIN_FD: i32 = 0;
 const STDOUT_FD: i32 = 1;
 const STDERR_FD: i32 = 2;
@@ -199,6 +215,7 @@ struct RymosAbi {
     time_unix_nanos: extern "sysv64" fn() -> u64,
     sleep_nanos: extern "sysv64" fn(u64),
     term_size: extern "sysv64" fn(*mut usize, *mut usize) -> i32,
+    std_fd: extern "sysv64" fn(i32) -> i32,
 }
 
 #[repr(C)]
@@ -364,6 +381,19 @@ struct AppEnvVar {
     value_len: usize,
 }
 
+/// The ambient per-"current app" state (`APP_FDS`/`APP_PIPES`/etc, all
+/// flat globals since there's no real per-process control block yet -- see
+/// `spawn_prepared`'s docs) saved by value before a synchronous spawn and
+/// restored after, so a child can't see or clobber its caller's fds/pipes/
+/// cwd/env. Copied *by value*, buffers included -- a nested spawn (a child
+/// that itself spawns, e.g. cargo -> rustc -> linker) keeps its caller's
+/// snapshot alive on the kernel's call stack for as long as it's still
+/// running, so the stack cost of *one* nested level is roughly this whole
+/// struct's size, and `N` levels deep costs roughly `N` times that. This is
+/// why `APP_PIPE_BUFFER_SIZE`/`APP_PIPE_COUNT` were raised conservatively
+/// rather than aggressively (see their docs) -- a properly deep fix would
+/// keep large buffers out of this stack-resident struct entirely (e.g.
+/// heap-backed pipes), not attempted here.
 #[derive(Clone, Copy)]
 struct AppStateSnapshot {
     console: *mut Console,
@@ -587,7 +617,7 @@ static ENV: [(&[u8], &[u8]); ENV_COUNT] = [
     (b"TMPDIR", b"pfs:tmp"),
 ];
 static RYMOS_ABI: RymosAbi = RymosAbi {
-    version: 22,
+    version: 23,
     write: abi_write,
     pid: abi_pid,
     args: abi_args,
@@ -626,6 +656,7 @@ static RYMOS_ABI: RymosAbi = RymosAbi {
     time_unix_nanos: abi_time_unix_nanos,
     sleep_nanos: abi_sleep_nanos,
     term_size: abi_term_size,
+    std_fd: abi_std_fd,
 };
 
 #[unsafe(no_mangle)]
@@ -1363,7 +1394,7 @@ impl PersistentFs {
                 0,
                 PFS_KIND_FILE,
                 &[],
-                read_tsc(),
+                ns_since_boot(),
                 PFS_MODE_DEFAULT_FILE,
             );
             if !Self::write_header(&header) {
@@ -1410,7 +1441,7 @@ impl PersistentFs {
             0,
             PFS_KIND_DIR,
             &[],
-            read_tsc(),
+            ns_since_boot(),
             PFS_MODE_DEFAULT_DIR,
         );
         if Self::write_header(&header) {
@@ -3104,7 +3135,7 @@ fn pfs_entry_mode(header: &[u8; PFS_HEADER_BYTES], index: usize) -> u8 {
 
 fn pfs_touch_modified(header: &mut [u8; PFS_HEADER_BYTES], index: usize) {
     let offset = pfs_entry_offset(index) + PFS_MODIFIED_OFFSET;
-    header[offset..offset + 8].copy_from_slice(&read_tsc().to_le_bytes());
+    header[offset..offset + 8].copy_from_slice(&ns_since_boot().to_le_bytes());
 }
 
 fn pfs_find_entry(header: &[u8; PFS_HEADER_BYTES], name: &[u8]) -> Option<usize> {
@@ -3163,7 +3194,11 @@ fn pfs_set_entry(
     mode: u8,
 ) {
     let offset = pfs_entry_offset(index);
-    let now = read_tsc();
+    // Calibrated ns-since-boot, same unit `time_ticks`'s ABI call reports --
+    // not raw `read_tsc()` cycles, which userspace has no way to convert
+    // back to real time (it only ever sees `time_ticks`/`time_unix_nanos`,
+    // never `TSC_HZ`/`BOOT_TSC`).
+    let now = ns_since_boot();
     header[offset..offset + PFS_ENTRY_SIZE].fill(0);
     header[offset] = kind;
     header[offset + 1] = name.len() as u8;
@@ -4206,7 +4241,7 @@ fn abi_open_pfs(name: &[u8], flags: u32) -> i32 {
                 0,
                 PFS_KIND_FILE,
                 &[],
-                read_tsc(),
+                ns_since_boot(),
                 PFS_MODE_DEFAULT_FILE,
             );
             if !PersistentFs::write_header(&header) {
@@ -4603,7 +4638,7 @@ extern "sysv64" fn abi_mkdir(path_ptr: *const u8, path_len: usize) -> i32 {
         0,
         PFS_KIND_DIR,
         &[],
-        read_tsc(),
+        ns_since_boot(),
         PFS_MODE_DEFAULT_DIR,
     );
     if PersistentFs::write_header(&header) {
@@ -5444,6 +5479,28 @@ extern "sysv64" fn abi_dup2(old_fd: i32, new_fd: i32) -> i32 {
     new_fd
 }
 
+/// Returns what `which` (`STDIN_FD`/`STDOUT_FD`/`STDERR_FD`) currently
+/// resolves to -- the real console (the fd number itself, e.g. `1` for
+/// `STDOUT_FD`) or a redirected fd (e.g. a pipe's write end), whichever
+/// `dup2` last pointed it at. Lets a caller save the *current* redirection
+/// before doing its own temporary one (e.g. `Command::output()` redirecting
+/// stdout onto a capturing pipe) and restore exactly that afterward via
+/// `dup2(saved, which)`, instead of unconditionally resetting to the real
+/// console -- which was a real, confirmed bug for any caller whose own
+/// stdout wasn't the console to begin with (a nested `Command` call, e.g.
+/// `relay` spawning `relay` spawning `hello`, undoing its *own* redirect by
+/// blindly pointing stdout back at the console instead of its caller's
+/// capturing pipe -- see `docs/self-hosting.md`'s Recently Closed).
+extern "sysv64" fn abi_std_fd(which: i32) -> i32 {
+    if !(STDIN_FD..=STDERR_FD).contains(&which) {
+        return -1;
+    }
+    unsafe {
+        let std_fds = core::ptr::addr_of!(APP_STD_FDS);
+        (*std_fds)[which as usize]
+    }
+}
+
 fn stat_path(path: &[u8]) -> Option<RymosStat> {
     let mut resolved = [0u8; PFS_NAME_MAX];
     if let Some(name_len) = pfs_resolve_path(path, &mut resolved) {
@@ -5568,19 +5625,32 @@ fn app_restore(snapshot: AppStateSnapshot) {
     }
 }
 
-fn app_restore_after_spawn(snapshot: AppStateSnapshot) {
-    let child_pipes = unsafe { *core::ptr::addr_of!(APP_PIPES) };
-    app_restore(snapshot);
+/// A confirmed, real bug lived here, not just a style nit: this used to
+/// snapshot the *entire* live `APP_PIPES` array into a local (`child_pipes`)
+/// before restoring, so the merge below could compare against it. That's an
+/// extra full-size copy of an already-large array (each `AppPipe` embeds a
+/// whole `APP_PIPE_BUFFER_SIZE`-byte buffer) on top of the `snapshot`
+/// parameter's own copy, stacked on the kernel's single call stack at every
+/// level of a nested spawn chain. Confirmed live: a real 3-level nested
+/// `Command` chain (`cargolike` -> `relay` -> `relay` -> `hello`) hung
+/// (not crashed -- this kernel has no stack guard page, so an overflow
+/// silently corrupts adjacent memory instead of faulting) right at this
+/// function's entry for the innermost spawn, the single deepest point of
+/// stack usage in the whole chain. Fixed by merging the live pipe data
+/// directly into `snapshot`'s own already-allocated `pipes` field instead of
+/// a second full-array copy -- same result, no extra large local.
+fn app_restore_after_spawn(mut snapshot: AppStateSnapshot) {
     unsafe {
-        let pipes = core::ptr::addr_of_mut!(APP_PIPES);
+        let pipes = core::ptr::addr_of!(APP_PIPES);
         for index in 0..APP_PIPE_COUNT {
             if snapshot.pipes[index].used {
-                (*pipes)[index].buffer = child_pipes[index].buffer;
-                (*pipes)[index].read_offset = child_pipes[index].read_offset;
-                (*pipes)[index].len = child_pipes[index].len;
+                snapshot.pipes[index].buffer = (*pipes)[index].buffer;
+                snapshot.pipes[index].read_offset = (*pipes)[index].read_offset;
+                snapshot.pipes[index].len = (*pipes)[index].len;
             }
         }
     }
+    app_restore(snapshot);
 }
 
 fn app_set_heap_window(pid: u32) {

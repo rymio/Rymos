@@ -74,3 +74,19 @@ bin = "stdshim"
 source = "programs/stdshim"
 install = "programs/stdshim.elf"
 enabled = true
+
+[[program]]
+name = "bigoutput"
+package = "rymos-program-bigoutput"
+bin = "bigoutput"
+source = "programs/bigoutput"
+install = "programs/bigoutput.elf"
+enabled = true
+
+[[program]]
+name = "relay"
+package = "rymos-program-relay"
+bin = "relay"
+source = "programs/relay"
+install = "programs/relay.elf"
+enabled = true

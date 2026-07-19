@@ -16,6 +16,8 @@ SELFHOST_MANIFEST = ROOT / "rymos-selfhost.toml"
 CUSTOM_TARGET = ROOT / "targets" / "x86_64-rymos.json"
 STABLE_TARGET = "x86_64-unknown-none"
 LOAD_ADDR = "0x200000"
+STD_TOOLCHAIN = "rymos-fork"
+TOOLCHAIN_RUST_DIR = ROOT / "toolchain" / "rust"
 
 
 def main() -> int:
@@ -76,7 +78,10 @@ def usage() -> None:
     print("  scripts/rymos-sdk.py selfhost-status")
     print("")
     print("Environment:")
-    print("  RYMOS_TARGET_MODE=auto|stable|custom  default: auto")
+    print("  RYMOS_TARGET_MODE=auto|stable|custom|std  default: auto")
+    print("    std: real std via the rymos-fork toolchain (see")
+    print("    docs/dev-environment.md) -- only for programs that opt into")
+    print("    real std (today: stdreal); never picked by auto")
 
 
 def discover_apps() -> list[dict[str, str]]:
@@ -163,8 +168,67 @@ def build_program(name: str) -> dict[str, str]:
     app = find_app(name)
     mode = target_mode()
     print(f"Building {app['package']} for RYMOS ({mode} target mode)", flush=True)
+    if mode == "std":
+        prepare_std_build()
     subprocess.run(build_command(app, mode), cwd=ROOT, env=build_env(mode), check=True)
     return app
+
+
+def prepare_std_build() -> None:
+    # A stale `-Z build-std` cache for this target can silently keep using
+    # pre-edit `library/std` sources after a real change -- confirmed live
+    # once already (see docs/self-hosting.md, category 5/6): a genuine bug
+    # fix looked like it hadn't taken effect at all until this exact
+    # directory was removed. Always start clean for std-mode builds rather
+    # than risk it -- this build is small/infrequent enough that the
+    # rebuild cost doesn't matter.
+    stale = ROOT / "target" / CUSTOM_TARGET.stem
+    if stale.exists():
+        shutil.rmtree(stale)
+
+    # `x.py build library/std` regenerates the stage1 sysroot's
+    # lib/rustlib/$HOST/bin/ directory on every rebuild, wiping this symlink
+    # each time -- see docs/dev-environment.md's "rust-lld gotcha". Recreate
+    # it here so a std-mode build doesn't fail with "linker `rust-lld` not
+    # found" just because the toolchain was rebuilt since the last install.
+    host = host_triple()
+    stage1_bin = TOOLCHAIN_RUST_DIR / "build" / "host" / "stage1" / "lib" / "rustlib" / host / "bin"
+    lld_link = stage1_bin / "rust-lld"
+    lld_target = (
+        TOOLCHAIN_RUST_DIR / "build" / host / "stage0-sysroot" / "lib" / "rustlib" / host / "bin" / "rust-lld"
+    )
+    if not lld_target.exists():
+        raise SystemExit(
+            f"missing stage0 rust-lld at {lld_target.relative_to(ROOT)} -- "
+            "build the rymos-fork toolchain first (docs/dev-environment.md, step 6)"
+        )
+    stage1_bin.mkdir(parents=True, exist_ok=True)
+    if lld_link.is_symlink() or lld_link.exists():
+        lld_link.unlink()
+    lld_link.symlink_to(lld_target)
+
+
+def host_triple() -> str:
+    result = subprocess.run(
+        ["rustc", "-vV"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True
+    )
+    for line in result.stdout.splitlines():
+        if line.startswith("host:"):
+            return line.split(":", 1)[1].strip()
+    raise SystemExit("could not determine host triple from `rustc -vV`")
+
+
+def strip_std_binary(path: Path) -> None:
+    # Real `std` binaries carry a lot more debug info than `no_std` ones
+    # even in release builds -- strip it so bootfs/the initrd stay small
+    # (see docs/dev-environment.md's note on debug binary size).
+    host = host_triple()
+    objcopy = (
+        TOOLCHAIN_RUST_DIR / "build" / "host" / "stage1" / "lib" / "rustlib" / host / "bin" / "rust-objcopy"
+    )
+    if not objcopy.exists():
+        raise SystemExit(f"missing {objcopy.relative_to(ROOT)} -- build the rymos-fork toolchain first")
+    subprocess.run([str(objcopy), "--strip-debug", str(path)], check=True)
 
 
 def install_program(name: str) -> dict[str, str]:
@@ -175,6 +239,8 @@ def install_program(name: str) -> dict[str, str]:
     dest = ROOT / "bootfs" / package["install"]
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, dest)
+    if mode == "std":
+        strip_std_binary(dest)
     print(f"Installed {source.relative_to(ROOT)} -> {dest.relative_to(ROOT)}")
     return {
         "name": package["name"],
@@ -248,9 +314,14 @@ def write_selfhost_report() -> None:
 
 def target_mode() -> str:
     requested = os.environ.get("RYMOS_TARGET_MODE", "auto")
-    if requested not in {"auto", "stable", "custom"}:
-        raise SystemExit("RYMOS_TARGET_MODE must be auto, stable, or custom")
+    if requested not in {"auto", "stable", "custom", "std"}:
+        raise SystemExit("RYMOS_TARGET_MODE must be auto, stable, custom, or std")
     if requested == "auto":
+        # "std" (real std via the forked rymos-fork toolchain) is never
+        # picked automatically -- it needs that toolchain link to exist
+        # locally (see docs/dev-environment.md) and only makes sense for a
+        # program that actually opts into real std (today just `stdreal`),
+        # not as a blanket default for every no_std program.
         return "custom" if cargo_is_nightly() else "stable"
     return requested
 
@@ -268,16 +339,31 @@ def cargo_is_nightly() -> bool:
 
 
 def build_command(app: dict[str, str], mode: str) -> list[str]:
-    command = ["cargo"]
-    if mode == "custom":
+    if mode == "std":
+        # Real `std` only builds through the forked rust-lang/rust checkout
+        # (`toolchain/rust`, linked locally as the `rymos-fork` rustup
+        # toolchain -- see docs/dev-environment.md), not whatever toolchain
+        # `cargo` would otherwise resolve to.
+        command = ["rustup", "run", STD_TOOLCHAIN, "cargo"]
         command += [
             "-Z",
-            "build-std=core,alloc,compiler_builtins",
+            "build-std=core,alloc,std,panic_abort,compiler_builtins",
             "-Z",
             "build-std-features=compiler-builtins-mem",
             "-Z",
             "json-target-spec",
         ]
+    else:
+        command = ["cargo"]
+        if mode == "custom":
+            command += [
+                "-Z",
+                "build-std=core,alloc,compiler_builtins",
+                "-Z",
+                "build-std-features=compiler-builtins-mem",
+                "-Z",
+                "json-target-spec",
+            ]
     command += ["build", "-p", app["package"], "--release", "--target", target_arg(mode)]
     return command
 
@@ -297,13 +383,13 @@ def build_env(mode: str) -> dict[str, str]:
 
 
 def target_arg(mode: str) -> str:
-    if mode == "custom":
+    if mode in {"custom", "std"}:
         return str(CUSTOM_TARGET.relative_to(ROOT))
     return STABLE_TARGET
 
 
 def target_dir(mode: str) -> str:
-    if mode == "custom":
+    if mode in {"custom", "std"}:
         return CUSTOM_TARGET.stem
     return STABLE_TARGET
 

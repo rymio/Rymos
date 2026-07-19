@@ -182,7 +182,7 @@ RYMOS can now run a tiny Rust `no_std` program from BootFS:
 run hello
 ```
 
-Programs are ELF64 binaries linked at `0x200000` and called with ABI v22:
+Programs are ELF64 binaries linked at `0x200000` and called with ABI v23:
 
 ```rust
 extern "sysv64" fn _start(abi: *const RymosAbi) -> i32
@@ -195,7 +195,7 @@ programs now implement `rymos_main()` and call runtime helpers such as
 
 For details, see `docs/program-abi.md`.
 
-ABI v22 currently supports console output, raw args, argv-preserving spawn,
+ABI v23 currently supports console output, raw args, argv-preserving spawn,
 argv-style reads, blocking line input, read-only BootFS file reads, BootFS
 read handles, RYMFS5 read/write/seek handles, file metadata/listing (with
 created/modified tick timestamps and a permission-style mode byte), compact
@@ -204,10 +204,11 @@ overrides, synchronous spawn/wait status, kernel-backed heap page allocation,
 standard descriptors, calibrated monotonic ticks (real nanoseconds since
 boot, not raw `rdtsc` cycles), real wall-clock time via the CMOS RTC, a real
 nanosecond-resolution sleep, terminal size, cwd/path resolution, errno-style
-`last_error`, process-local pipes, std fd redirection/inheritance, and exit
-codes by return value. Spawned children now run in their own isolated
-address space instead of the shared fixed-address window earlier milestones
-used (see `docs/self-hosting.md`).
+`last_error`, process-local pipes, std fd redirection/inheritance, a query
+for a std fd's current redirection target, and exit codes by return value.
+Spawned children now run in their own isolated address space instead of the
+shared fixed-address window earlier milestones used (see
+`docs/self-hosting.md`).
 
 ## SDK And Packages
 
@@ -269,12 +270,30 @@ The runtime gives each process its own 256 MiB windowed bump heap, and
 inside RYMOS. A forked `rustc` toolchain also lives at `toolchain/rust` (git
 submodule) with real `std` support for `x86_64-rymos` -- a genuine
 `std`-linked binary boots and runs today, with real `std::fs`, `std::env`
-(including argv, cwd, `temp_dir`), `std::time::Instant` (ordering), and
-`std::random`-backed `HashMap` support, verified via `programs/stdreal` (a
-manually-built test, not part of the normal SDK flow -- see
-`docs/dev-environment.md`). `std::process::Command` (spawning) is still
-unsupported by design: RYMOS resolves programs by name through `bootfs`, not
-a resolved filesystem path the way Unix's fork/exec model assumes. See
+(including argv, cwd, `temp_dir`), `std::time::Instant`/`SystemTime`
+(ordering and duration arithmetic, wall clock included), `std::thread::sleep`,
+`std::random`-backed `HashMap` support, and real `std::process::Command`
+(spawning a real child and capturing its exit status/stdout/stderr via
+`.output()`/`.status()`) -- verified via `programs/stdreal`, which now has a
+real one-command build pipeline (`RYMOS_TARGET_MODE=std python3
+scripts/rymos-sdk.py install stdreal`) rather than being hand-built. The one
+disclosed limitation: `Command::spawn()` followed by writing to `Child::stdin`
+doesn't behave like a real OS, since RYMOS's spawn runs the child to
+completion before returning -- fixing that needs real concurrent execution,
+not more ABI wiring. A first cargo-shaped smoke test, `programs/cargolike`
+(plus a `programs/bigoutput` helper), then ran live in QEMU and found three
+real gaps `stdreal` alone hadn't exercised -- a per-pipe buffer that silently
+truncated large captured child output, a per-process env table small enough
+that a real cargo child's env vars would abort the whole process instead of
+just failing the call, and file mtimes that were never wired up even though
+the kernel already tracked them -- all three now fixed. A follow-up nested-
+spawn test, `programs/relay` (a child that itself spawns a child, the real
+shape of cargo -> rustc -> linker, rather than `cargolike`'s flat sequential
+spawns), found three more real, layered bugs -- pipe-slot exhaustion, a
+`dup2`-based stdio-restore bug that silently dropped a nested child's output
+to the console instead of its actual caller's pipe, and a kernel-stack-cost
+bug that hung (not crashed) a deep chain -- all three now fixed and verified
+4 levels deep, through both `rymos-user`'s and `std`'s `Command`. See
 `docs/self-hosting.md` for exactly what's real vs. still stubbed, and
 `docs/dev-environment.md` for the full build-from-scratch steps.
 
@@ -410,8 +429,16 @@ programs/heapstress/         mmap/heap pressure smoke test
 programs/stdshim/            std-shaped runtime shim smoke test
 programs/faultcheck/         Manual CPU exception diagnostic (crashes on purpose)
 programs/stdreal/            Genuine std::fs/env/process/time/random smoke
-                             test -- built manually via the forked toolchain,
-                             not through scripts/rymos-sdk.py
+                             test -- built via RYMOS_TARGET_MODE=std
+                             scripts/rymos-sdk.py, the forked toolchain's
+                             -Z build-std path
+programs/cargolike/          Cargo-shaped std smoke test (many env vars,
+                             recursive dir/mtime walk, repeated spawns,
+                             large captured output) -- same std build mode
+programs/bigoutput/          no_std helper writing large stdout, for
+                             cargolike's output-capture check
+programs/relay/              no_std helper that re-spawns itself, for
+                             cargolike's nested-spawn check
 programs/rysh/               Tiny RYMOS script interpreter
 targets/x86_64-rymos.json    Canonical custom target spec for programs
 toolchain/rust/              Forked rust-lang/rust (submodule) with real

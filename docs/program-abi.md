@@ -4,7 +4,7 @@ RYMOS programs are Rust-first, `no_std` ELF binaries.
 
 Current ABI status:
 
-- ABI version: `22`
+- ABI version: `23`
 - Architecture: `x86_64`
 - Format: ELF64
 - Runtime crate: `runtime/rymos-user`
@@ -21,7 +21,8 @@ Current ABI status:
   `rename`
 - Standard descriptors: fd `0` stdin, fd `1` stdout, fd `2` stderr
 - Pipes: in-memory fd pairs through `pipe`
-- Descriptor redirection: `dup2` can map fd `0`, `1`, or `2` to another fd
+- Descriptor redirection: `dup2` can map fd `0`, `1`, or `2` to another fd;
+  `std_fd` reports what a given std fd currently resolves to
 - Input: blocking line input through `read_line`
 - Process: `pid`, synchronous `spawn`, consuming `wait`, and child `wait_any`
 - Metadata: `stat` and `list`
@@ -90,6 +91,7 @@ pub struct RymosAbi {
     pub time_unix_nanos: extern "sysv64" fn() -> u64,
     pub sleep_nanos: extern "sysv64" fn(u64),
     pub term_size: extern "sysv64" fn(*mut usize, *mut usize) -> i32,
+    pub std_fd: extern "sysv64" fn(i32) -> i32,
 }
 ```
 
@@ -232,6 +234,16 @@ its default console behavior.
 `term_size(rows_ptr, cols_ptr)` writes the console's current row and column
 count to caller memory and returns `0`, or `-1` on error.
 
+`std_fd(which)` returns what standard fd `which` (`0`/`1`/`2`) currently
+resolves to -- the real console (the fd number itself) or a redirected fd
+(e.g. a pipe's write end), whichever `dup2` last pointed it at. Lets a
+caller save the *current* redirection before doing its own temporary one
+(e.g. `Command::output()` redirecting stdout onto a capturing pipe) and
+restore exactly that afterward via `dup2(saved, which)`, instead of
+unconditionally resetting to the real console -- which was a real,
+confirmed bug for a nested `Command` call whose own stdout wasn't the
+console to begin with (see `docs/self-hosting.md`'s Recently Closed).
+
 ## Core Runtime
 
 Milestone 4 adds `rymos-user`, the first user-program runtime crate. Programs
@@ -245,7 +257,8 @@ now implement `rymos_main()` and use safe wrappers for the ABI calls:
   `File::read`, and `File::close`
 - `env_get`, `env_list`, `env_set`, `env_remove`, `spawn`, `wait`,
   `mem_alloc_pages`, `mem_map_pages`, `mem_unmap_pages`, `time_ticks`,
-  `unlink`, `rename`, `cwd`, `chdir`, `last_error`, `pipe`, and `dup2`
+  `unlink`, `rename`, `cwd`, `chdir`, `last_error`, `pipe`, `dup2`, and
+  `std_fd`
 - `Command::new(...).arg(...).args_raw(...).stdin(...).env(...)
   .env_remove(...).current_dir(...).stdout_file(...).stderr_file(...)
   .output()` and `.status()` as the first small
@@ -362,6 +375,11 @@ Milestones 1 through 8 are complete:
   new `time_unix_nanos` (real wall-clock time via the CMOS RTC),
   `sleep_nanos` (real busy-wait sleep), and `term_size` (console row/column
   count)
+- ABI v23 `std_fd` reports what a std fd currently resolves to, so a nested
+  `Command` call can save and restore its caller's actual stdio redirection
+  instead of a fixed `dup2`-based reset assuming it was always the console --
+  a real bug found live via a nested-spawn stress test (`programs/relay`),
+  see `docs/self-hosting.md`'s Recently Closed
 
 ## Next ABI Milestones
 

@@ -71,6 +71,7 @@ pub struct RymosAbi {
     pub time_unix_nanos: extern "sysv64" fn() -> u64,
     pub sleep_nanos: extern "sysv64" fn(u64),
     pub term_size: extern "sysv64" fn(*mut usize, *mut usize) -> i32,
+    pub std_fd: extern "sysv64" fn(i32) -> i32,
 }
 
 static mut ABI: *const RymosAbi = core::ptr::null();
@@ -979,6 +980,7 @@ fn run_command_output(
     command_cwd: Option<&[u8]>,
     env_overrides: &[CommandEnv],
 ) -> Result<CommandOutput, i32> {
+    let saved_stdio = save_stdio();
     let mut saved_cwd_buffer = [0u8; 64];
     let saved_cwd_len = match command_cwd {
         Some(_) => {
@@ -1044,7 +1046,7 @@ fn run_command_output(
     let _ = fd_write(stdin_write, stdin);
     if !dup2(stdin_read, STDIN) || !dup2(stdout_write, STDOUT) || !dup2(stderr_write, STDERR) {
         let error = last_error();
-        reset_stdio();
+        restore_stdio(saved_stdio);
         close_many(&[
             stdin_read,
             stdin_write,
@@ -1062,7 +1064,7 @@ fn run_command_output(
     }
 
     let spawn_result = spawn_command(name, args, argv);
-    reset_stdio();
+    restore_stdio(saved_stdio);
     restore_command_context(
         command_cwd,
         &saved_cwd_buffer[..saved_cwd_len],
@@ -1126,6 +1128,7 @@ fn run_command_status(
     stdout_file: Option<&[u8]>,
     stderr_file: Option<&[u8]>,
 ) -> Result<CommandStatus, i32> {
+    let saved_stdio = save_stdio();
     let mut saved_cwd_buffer = [0u8; 64];
     let saved_cwd_len = match command_cwd {
         Some(_) => {
@@ -1166,7 +1169,7 @@ fn run_command_status(
         let _ = fd_write(stdin_write, stdin);
         if !dup2(stdin_read, STDIN) {
             let error = last_error();
-            reset_stdio();
+            restore_stdio(saved_stdio);
             close_many(&[stdin_read, stdin_write]);
             restore_command_context(
                 command_cwd,
@@ -1184,7 +1187,7 @@ fn run_command_status(
             Some(file) => file,
             None => {
                 let error = last_error();
-                reset_stdio();
+                restore_stdio(saved_stdio);
                 if let Some((stdin_read, stdin_write)) = stdin_fds {
                     close_many(&[stdin_read, stdin_write]);
                 }
@@ -1198,7 +1201,7 @@ fn run_command_status(
         };
         if !dup2(file.fd, STDOUT) {
             let error = last_error();
-            reset_stdio();
+            restore_stdio(saved_stdio);
             if let Some((stdin_read, stdin_write)) = stdin_fds {
                 close_many(&[stdin_read, stdin_write]);
             }
@@ -1218,7 +1221,7 @@ fn run_command_status(
             Some(file) => file,
             None => {
                 let error = last_error();
-                reset_stdio();
+                restore_stdio(saved_stdio);
                 if let Some((stdin_read, stdin_write)) = stdin_fds {
                     close_many(&[stdin_read, stdin_write]);
                 }
@@ -1232,7 +1235,7 @@ fn run_command_status(
         };
         if !dup2(file.fd, STDERR) {
             let error = last_error();
-            reset_stdio();
+            restore_stdio(saved_stdio);
             if let Some((stdin_read, stdin_write)) = stdin_fds {
                 close_many(&[stdin_read, stdin_write]);
             }
@@ -1247,7 +1250,7 @@ fn run_command_status(
     }
 
     let spawn_result = spawn_command(name, args, argv);
-    reset_stdio();
+    restore_stdio(saved_stdio);
     restore_command_context(
         command_cwd,
         &saved_cwd_buffer[..saved_cwd_len],
@@ -1374,10 +1377,20 @@ fn read_all_available(fd: i32) -> Vec<u8> {
     output
 }
 
-fn reset_stdio() {
-    let _ = dup2(STDIN, STDIN);
-    let _ = dup2(STDOUT, STDOUT);
-    let _ = dup2(STDERR, STDERR);
+/// Restores STDIN/STDOUT/STDERR to exactly what `save_stdio` captured --
+/// *not* always the console. Fixes a real, confirmed bug: the old
+/// `reset_stdio` unconditionally pointed all three back at the console
+/// (`dup2(STDOUT, STDOUT)`'s "same fd" case means "point at the real
+/// console," not "leave it alone"), which is correct only when the caller's
+/// own ambient stdio was already the console -- wrong for a nested
+/// `Command` call, where the caller's own stdout is itself someone else's
+/// capturing pipe. That silently dropped a nested child's output straight
+/// to the console instead of into its actual caller's pipe (see
+/// `docs/self-hosting.md`'s Recently Closed).
+fn restore_stdio(saved: [i32; 3]) {
+    let _ = dup2(saved[0], STDIN);
+    let _ = dup2(saved[1], STDOUT);
+    let _ = dup2(saved[2], STDERR);
 }
 
 fn close_many(fds: &[i32]) {
@@ -1486,6 +1499,20 @@ pub fn pipe() -> Option<(i32, i32)> {
 
 pub fn dup2(old_fd: i32, new_fd: i32) -> bool {
     with_abi(|abi| (abi.dup2)(old_fd, new_fd) == new_fd).unwrap_or(false)
+}
+
+/// What `which` (`STDIN`/`STDOUT`/`STDERR`) currently resolves to -- the
+/// real console, or whatever `dup2` last redirected it to. Used to save the
+/// *current* redirection before `Command` does its own temporary one, so it
+/// can be restored exactly afterward (see `restore_stdio`) instead of always
+/// resetting to the console, which is wrong whenever the caller's own
+/// stdout wasn't the console to begin with (a nested `Command` call).
+fn std_fd(which: i32) -> i32 {
+    with_abi(|abi| (abi.std_fd)(which)).unwrap_or(which)
+}
+
+fn save_stdio() -> [i32; 3] {
+    [std_fd(STDIN), std_fd(STDOUT), std_fd(STDERR)]
 }
 
 pub fn fd_read<'a>(fd: i32, buffer: &'a mut [u8]) -> Option<&'a [u8]> {

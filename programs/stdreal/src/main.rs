@@ -104,5 +104,36 @@ fn main() {
     map.insert("b", 2);
     println!("stdreal HashMap sum: {}", map.values().sum::<i32>());
 
+    // Real std::process::Command: RYMOS's ABI runs a spawned child to
+    // completion before returning (see sys::process::rymos's docs), so by
+    // the time `output()`/`status()` get control back, the child's exit
+    // status and full stdout/stderr are already final -- exactly what these
+    // two methods need, unlike interactive `Child::stdin` writes.
+    match std::process::Command::new("hello").arg("readme.txt").output() {
+        Ok(output) => {
+            println!(
+                "stdreal Command::output status={:?} stdout_len={}",
+                output.status.code(),
+                output.stdout.len()
+            );
+        }
+        Err(err) => println!("stdreal Command::output FAILED: {err}"),
+    }
+
+    match std::process::Command::new("hello")
+        .arg("readme.txt")
+        .env("STDREAL_CHILD_VAR", "child-env-value")
+        .status()
+    {
+        Ok(status) => println!("stdreal Command::status success={}", status.success()),
+        Err(err) => println!("stdreal Command::status FAILED: {err}"),
+    }
+
+    // The env override above must not leak into this (parent) process.
+    match std::env::var("STDREAL_CHILD_VAR") {
+        Ok(value) => println!("stdreal Command env leaked FAILED: {value}"),
+        Err(_) => println!("stdreal Command env override correctly did not leak"),
+    }
+
     println!("stdreal: ok");
 }

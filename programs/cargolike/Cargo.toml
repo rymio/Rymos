@@ -1,0 +1,9 @@
+[package]
+name = "rymos-program-cargolike"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "cargolike"
+path = "src/main.rs"

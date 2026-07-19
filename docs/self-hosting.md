@@ -85,18 +85,228 @@ toolchain yet.
 - `toolchain/rust` (a forked `rust-lang/rust` checkout, git submodule) builds
   a real `library/std` for `x86_64-rymos`, with a real ABI-wired `_start`
   entry and a real bump allocator over `mem_alloc_pages`. Real `std::fs`,
-  `std::env` (including argv, cwd, and `temp_dir`), `std::time::Instant`
-  (ordering only, not duration arithmetic), and `std::random`-backed
-  `HashMap` support now round-trip against the ABI too -- not just
-  stdio/alloc. `std::process::Command` (spawning) stays unsupported on
-  purpose: it's a real design mismatch with how RYMOS resolves programs, not
-  a bounded wiring task (see Recently Closed). Still stubbed: real errno
-  detail beyond the basic `ERR_*` set already mapped, and `Instant`'s
-  duration arithmetic (needs category 4's tick calibration first).
+  `std::env` (including argv, cwd, and `temp_dir`), `std::time::Instant` and
+  `std::time::SystemTime` (both ordering *and* duration arithmetic, wall
+  clock included), `std::thread::sleep`, and `std::random`-backed `HashMap`
+  support all round-trip against the ABI -- not just stdio/alloc anymore.
+  `std::process::Command` is real too now: `output()`/`.status()` work
+  completely (RYMOS's synchronous spawn means the child's exit status and
+  full stdout/stderr are already final by the time these read them), with
+  one disclosed limitation -- `Command::spawn()` followed by writing to
+  `Child::stdin` doesn't behave like a real OS, since the child has already
+  run by the time `spawn()` returns (see Recently Closed). `stdreal`, the
+  real-`std` test program, now has a repeatable one-command build pipeline
+  (`RYMOS_TARGET_MODE=std`) instead of being hand-built. Still stubbed: real
+  errno detail beyond the basic `ERR_*` set already mapped.
 
 See `docs/rust-port-roadmap.md` for the detailed cargo/rustc port sequence.
 
 ## Recently Closed
+
+- **`relay`: a nested-spawn stress test that found and fixed three real,
+  layered gaps `cargolike`'s flat, sequential tests couldn't see**:
+  `cargolike`'s `repeated_spawn_test` only proved *sequential* spawns (one
+  at a time, each fully finished before the next starts) don't leak
+  process-table slots. A real cargo -> rustc -> linker chain is *nested*: a
+  child spawns its own child before the outer `Command::output()` call
+  returns. Since RYMOS's spawn runs synchronously to completion, a nested
+  spawn keeps every enclosing level's `AppStateSnapshot` (the ambient
+  fds/pipes/cwd/env state `spawn`/`Command` save-and-restore around a
+  synchronous child) sitting on the kernel's single call stack until the
+  whole chain unwinds -- a fundamentally different situation than any prior
+  test exercised. Wrote `programs/relay`, a `no_std` helper that re-spawns
+  itself `depth` times via `Command::output()` before bottoming out by
+  spawning `hello`, and drove it both directly and through `cargolike`'s
+  (`std`) `Command` to find out what actually happens. All three gaps found
+  are now fixed; nested `Command` usage (verified 4 levels deep, through
+  both `rymos-user`'s and `std`'s `Command`) is real.
+  - **Pipe-slot exhaustion**: each `Command::output()`/`.status()` call
+    holds 3 pipe slots open (stdin/stdout/stderr) for its *entire* duration,
+    including however long a nested child takes -- so `APP_PIPE_COUNT`'s old
+    value of 4 supported barely more than one link of nesting before the
+    next link's pipe allocation failed with `ERR_NOSPC`. Raised to 12.
+  - **The real, deeper bug: `dup2`-based stdio restore, not the pipe
+    table**: raising `APP_PIPE_COUNT` high enough for a nested chain to
+    actually *proceed* didn't fix anything by itself -- it exposed a second
+    bug that looked, at first, like it lived in `app_restore_after_spawn`'s
+    pipe-buffer merge (which only holds for one level of redirection). The
+    real root cause was `reset_stdio` (present in both `rymos-user` and
+    `sys::process::rymos`, `std`'s `Command` impl): after a `Command` call,
+    it unconditionally reset `STDIN`/`STDOUT`/`STDERR` back to *the real
+    console* (`dup2(STDOUT, STDOUT)`'s "same fd" case means exactly that,
+    not "leave it alone"). That's correct only when the caller's own
+    ambient stdio already was the console -- wrong for a nested call, whose
+    caller's stdout is itself someone else's capturing pipe. Concretely:
+    `relay(0)` undoing its *own* redirect (after spawning `hello`) blew away
+    `relay(1)`'s redirect instead of restoring it, so everything `relay(0)`
+    printed afterward went straight to the console instead of into
+    `relay(1)`'s pipe -- confirmed directly against `relay` alone (bypassing
+    `std` entirely): a nested chain reported a clean success exit code, but
+    its captured output was truncated to just its first line, with `hello`'s
+    real output leaking straight to the serial console instead of being
+    captured. Fixed with a new ABI call, `std_fd` (ABI v23), that reports
+    what a std fd *currently* resolves to; both `Command` implementations
+    now save the real pre-redirect value (`save_stdio`) before their own
+    redirection and restore exactly that afterward (`restore_stdio`),
+    instead of assuming "console."
+  - **A third, genuinely different bug surfaced once the first two were
+    fixed**: with the redirect logic correct, a real 3-4 level nested
+    `Command` chain still *hung* (not crashed) partway through unwinding the
+    innermost spawn. Traced (via temporary debug prints in
+    `run_ready_task`) to `app_restore_after_spawn` itself: it used to
+    snapshot the *entire* live `APP_PIPES` array into a local
+    (`child_pipes`) before merging, an extra full-size copy (each `AppPipe`
+    embeds a whole `APP_PIPE_BUFFER_SIZE`-byte buffer) on top of the
+    already-large `AppStateSnapshot` parameter, stacked at every level of a
+    nested chain. This kernel has no stack guard page, so overflowing it
+    silently corrupts adjacent memory instead of cleanly faulting -- a hang,
+    not a diagnosed crash. Confirmed live: a 3-level chain hung right at
+    this function's entry for the innermost spawn, the single deepest point
+    of stack usage in the whole chain. Fixed by merging the live pipe data
+    directly into the snapshot's own already-allocated `pipes` field instead
+    of a second full-array copy -- same result, no extra large local.
+  - Verified live in QEMU end to end: a 3-level nested `relay` chain
+    (bypassing `std`) and a 4-level chain through `cargolike`'s `std`
+    `Command` both complete cleanly, with every level's output (including
+    `hello`'s real file contents) correctly propagated all the way up to the
+    top-level capture -- not just "didn't crash," but byte-for-byte correct.
+
+- **`cargolike`: a cargo-shaped smoke test that found three real gaps
+  `stdreal` never exercised, all now fixed**: category 6 proved
+  `std::process::Command` and a `stdreal` build pipeline worked end to end on
+  one hand-written program, but flagged that this didn't prove cargo's actual
+  patterns (many injected env vars per child, recursive directory walks with
+  real mtimes, several sequential child invocations, large captured child
+  output) were dependable. Wrote `programs/cargolike` (a real-`std` program,
+  built the same `RYMOS_TARGET_MODE=std` way as `stdreal`) plus
+  `programs/bigoutput` (a `no_std` helper that writes ~6.6 KB of stdout, well
+  past any output `stdreal` had produced) and ran them live in QEMU to find
+  out empirically rather than guess. Two of three hypotheses were confirmed
+  as real, fixable gaps; one (process-table exhaustion across repeated
+  spawns) was ruled out -- 8 sequential `Command::output()` calls in a row
+  all succeeded with no leak, since the process table already reclaims a
+  zombie slot once its parent has waited on it (category 2).
+  - **Pipe buffer truncation**: `Command::output()` capturing `bigoutput`'s
+    ~6.6 KB of stdout came back truncated to exactly 1024 bytes -- the ABI's
+    per-pipe buffer (`APP_PIPE_BUFFER_SIZE`) was a fixed 1 KiB, far smaller
+    than a real rustc invocation's diagnostics routinely are. Raised to 8
+    KiB (`kernel/src/main.rs`) -- generous headroom without the static-memory
+    or (since these buffers are embedded in a snapshot struct copied around
+    stack-locally at `spawn`/redirect boundaries, not just a `static`) stack
+    footprint concern a jump straight to 64 KiB would have carried. Verified
+    live: the same capture now comes back at the real 6634 bytes (6600 from
+    the loop plus a summary line), not truncated.
+  - **Env var ceiling was reached almost immediately, and aborted the whole
+    process, not just the `set_var` call**: RYMOS's env table
+    (`APP_ENV_COUNT`) was a fixed 8 slots *total*, including the 6 the kernel
+    seeds by default (`PATH`/`HOME`/`SHELL`/`USER`/`RYMOS_TARGET`/`TMPDIR`),
+    leaving only 2 free -- nowhere near a real cargo child's dozen-plus
+    (`CARGO_MANIFEST_DIR`/`OUT_DIR`/`TARGET`/`RUSTC`/`CARGO_PKG_*`/...).
+    Confirmed live in QEMU that hitting the ceiling doesn't just return an
+    error: `std::env::set_var` panics on any backend failure, and since this
+    target builds `std` with `panic_abort` (no unwinding), that aborts the
+    entire process via `abort_internal`'s `ud2` -- caught cleanly by
+    category 3's CPU exception handler as a diagnosed halt rather than a
+    silent crash, but a hard stop all the same. Raised `APP_ENV_COUNT` from
+    8 to 64 slots; re-verified live that the *raised* ceiling still fails the
+    same safe way once genuinely exhausted (pushed a test past it, to 128
+    vars, and got the same clean exception-handler halt), rather than
+    silently corrupting memory once the new, larger table is full.
+  - **`FileAttr::modified()`/`created()` were stubbed `unsupported()` even
+    though the data already existed**: `Stat` (from category 5) already
+    carried `created_ticks`/`modified_ticks`, but nothing read them. The
+    on-disk PFS values themselves turned out to be raw `rdtsc` cycle counts
+    (`pfs_set_entry`/`pfs_touch_modified` in `kernel/src/main.rs`), not the
+    same calibrated nanoseconds-since-boot unit `time_ticks`'s ABI call
+    reports -- userspace only ever sees `time_ticks`/`time_unix_nanos`, never
+    the kernel-internal `TSC_HZ`/`BOOT_TSC` needed to convert a raw cycle
+    count back into real time, so storing raw cycles there was a dead end
+    for libstd regardless of what stub code was written on top of it. Fixed
+    at the source: PFS now stores `ns_since_boot()` (the same unit
+    `time_ticks` already exposes) at every create/modify site instead of raw
+    `read_tsc()`. `sys::fs::rymos::FileAttr::modified()`/`created()` then
+    convert that to a real `SystemTime` via
+    `time_unix_nanos() - time_ticks()` as the boot-time offset -- the same
+    arithmetic the kernel does internally with `BOOT_UNIX_NANOS`, just
+    computed from the userspace side of the ABI, which never sees that
+    constant directly. `accessed()` deliberately stays `unsupported()`: `Stat`
+    has no real access-time field at all, and there's no data to report
+    without fabricating one. Verified live in QEMU:
+    `fs::metadata(...).modified()` on a freshly-written PFS file returned a
+    real Unix timestamp matching the actual date, not the previous
+    `unsupported` error.
+
+  `cargolike` (like `stdreal`) is deliberately kept out of
+  `rymos-packages.toml`/`autoexec.bat`'s default flow -- it's a `std`-mode
+  diagnostic program, not a shipped one.
+
+- **Real `std::process::Command`, and a real build pipeline for `stdreal`**
+  (category 6 -- the last major stretch before self-hosting becomes
+  reachable): `std::process::Command` (spawning) was left deliberately
+  unsupported after category 5, flagged as "a real design mismatch, not a
+  bounded wiring task." Revisiting it found the mismatch was narrower than
+  first assessed: RYMOS's `spawn`/`spawn_argv` run the child to completion
+  *inline* before returning (no fork+exec, no real concurrency -- see
+  category 2), and `rymos-user`'s own `Command` (used successfully
+  throughout this project by `cmdapi`/`stdshim`) already proved that
+  "snapshot the ambient stdio/cwd/env state, mutate it, spawn synchronously,
+  restore it" is a correct pattern for that model. Porting the same pattern
+  into `std`'s `sys::process` module, rather than inventing something new,
+  turned out to be a bounded, well-defined task after all:
+  - `sys::pipe::rymos` wraps the ABI's `pipe`/`read`/`write_fd`/`close` --
+    real in-memory pipes, not a stub.
+  - `sys::process::rymos` implements `Command`, `Stdio`, `Process`,
+    `ExitStatus`, `ExitCode`. Stdio redirection dup2's the child's stdin/
+    stdout/stderr onto the ambient std fds before spawning (exactly
+    `rymos-user::Command`'s approach), snapshotting and restoring the
+    original std fds, cwd, and env afterward regardless of success or
+    failure. Env overrides (including a full `env_clear()`) snapshot every
+    touched key's original value first so they can be restored precisely,
+    not just approximately.
+  - `Stdio::null()` has no real `/dev/null` to back it, so it uses a scratch
+    pipe whose unused end is immediately dropped: reading an empty pipe
+    with no writer returns `0` (EOF) immediately rather than blocking (see
+    `kernel/src/main.rs`'s `abi_read`), so this behaves exactly like a null
+    device in both directions without needing a dedicated null-device
+    concept at the ABI level.
+  - Because the child always finishes before `spawn` returns, `Process` can
+    just store the already-known exit code directly -- `wait`/`try_wait`
+    are table lookups, not real waits, matching how the ABI itself already
+    works (`abi::wait` was always a lookup against an already-finished
+    child, not a real wait, even before this).
+  - The one real, disclosed limitation: `Command::spawn()` followed by
+    writing to `Child::stdin` does **not** behave like a real OS. The child
+    has already run (and already read whatever was in its stdin pipe, or
+    read nothing) by the time `spawn()` returns, so anything written
+    afterward never reaches it. This doesn't affect `output()`/`.status()`
+    (the methods cargo/rustc invocation actually uses) since neither feeds
+    stdin data by default -- it only affects the less-common pattern of
+    spawning and then interactively writing to a child's stdin, which needs
+    real concurrent execution to fix properly (category 2's still-open
+    scheduler work), not more ABI wiring.
+
+  Verified live in QEMU: `stdreal`'s `Command::output()` captured a real
+  child's exit code (`0`) and 326 bytes of its actual stdout content (not
+  garbage); `Command::status()` with an `env()` override succeeded, and the
+  override was confirmed *not* to leak into the parent's own environment
+  afterward -- both against the full existing regression suite, undisturbed.
+
+  Separately, `stdreal` (the real-`std` test program) went from a hand-run
+  sequence of manual commands to a real, repeatable build pipeline:
+  `RYMOS_TARGET_MODE=std python3 scripts/rymos-sdk.py install stdreal` now
+  builds it via the `rymos-fork` toolchain's `-Z build-std` path end to end.
+  The script automates three things that were previously easy to get wrong
+  by hand (and did, earlier this session): it always clears the stale
+  `-Z build-std` target cache before building (the exact gotcha that
+  produced a real, confirmed false crash in category 5 -- a genuine fix
+  looked like it hadn't taken effect until the directory was removed); it
+  recreates the `rust-lld` symlink the stage1 sysroot loses on every
+  toolchain rebuild (`docs/dev-environment.md`'s "rust-lld gotcha"); and it
+  strips debug symbols afterward (a `--release` real-`std` binary is still
+  ~1.2 MB unstripped vs ~100 KB stripped). Deliberately kept out of
+  `rymos-packages.toml`/`install-all`'s default flow -- `std` mode is never
+  auto-selected, and only `stdreal` opts into it today, so contaminating the
+  default no_std build path with it would be a regression, not progress.
 
 - **Calibrated time, sleep, wall clock, and terminal size** (category 4):
   `time_ticks` used to be a raw `rdtsc` read with no defined relationship to
@@ -602,27 +812,44 @@ The remaining blockers are now narrower and more concrete:
      codes to real `ErrorKind`s; see Recently Closed. Still narrow: only the
      handful of error codes the ABI actually defines are mapped, not a broad
      errno taxonomy
-   - `std::time::Instant` -- done for ordering/equality; duration arithmetic
-     (`.elapsed()` and friends) still honestly unsupported, gated on
-     category 4's tick calibration (no PIT/timer or CPUID TSC-frequency
-     detection exists yet to convert raw `rdtsc` ticks into real time units)
-   - `std::process::Command` (spawning) -- deliberately still unsupported:
-     a real design mismatch (RYMOS resolves programs by name through
-     `bootfs`, not a resolved filesystem path; `Stdio`/pipe wiring would
-     need `sys::pipe` support too), not a bounded wiring task like the
-     others were; see Recently Closed. `std::process::id()` is done.
+   - `std::time::Instant`/`SystemTime` -- done, ordering *and* duration
+     arithmetic, wall clock included; see category 4's Recently Closed entry
+   - `std::process::Command` (spawning) -- done: `sys::pipe::rymos` plus
+     `sys::process::rymos` implement it using the same pattern
+     `rymos-user::Command` already proved correct (dup2 stdio onto the
+     ambient std fds, snapshot/restore cwd and env, spawn synchronously).
+     `output()`/`.status()` work completely; `std::process::id()` too. Real,
+     disclosed limitation: `Command::spawn()` + writing to `Child::stdin`
+     afterward doesn't work like a real OS (the child already ran by then)
+     -- needs real concurrent execution to fix, not more ABI wiring; see
+     category 6's Recently Closed entry
    - real thread support if it's ever needed (today `no_threads` is correct
      for RYMOS's single-threaded-per-process reality, but note this in case
      that reality changes -- see Process model, item 2)
    - cross-compile small `std` CLI programs that actually touch `fs`/`env` --
-     done: see `stdreal` in Recently Closed. Still ahead: this was one
-     hand-written manual test, not a build pipeline -- integrating real
-     `std` builds into `scripts/rymos-sdk.py`/`make programs` (today's SDK
-     only builds `no_std` programs against the stable-compatible fallback
-     target) is still its own separate lift before attempting cargo
+     done: see `stdreal` in Recently Closed, now with a real one-command
+     build pipeline (`RYMOS_TARGET_MODE=std`) instead of a hand-built test
 
 6. Cargo and rustc:
-   - run cargo-like helper programs first
+   - `std::process::Command` and a repeatable `stdreal` build pipeline --
+     done: see Recently Closed. These were flagged as the last major
+     stretch before self-hosting becomes reachable; both are closed now,
+     but that means the plumbing works end to end on one hand-written test
+     program, not that cargo's real dependency graph/build scripts or
+     rustc's own scale are dependable yet -- the items below are still real,
+     not just formalities
+   - run cargo-like helper programs first -- done: `cargolike`/`bigoutput`
+     found and closed three real gaps (pipe-buffer truncation, an env-var
+     ceiling that aborted the whole process instead of just failing the
+     call, and unwired file mtimes); see Recently Closed. Confirmed *not* an
+     issue: repeated sequential spawns (8 in a row) don't leak process-table
+     slots. `relay` then found nested (not just sequential) spawns had three
+     real, layered bugs -- pipe-slot exhaustion, a `dup2`-based stdio-restore
+     bug that silently dropped a nested child's output to the console
+     instead of its caller's pipe, and a kernel-stack-cost bug that hung
+     (not crashed) a deep chain -- all three now fixed and verified 4 levels
+     deep through both `rymos-user`'s and `std`'s `Command`; see Recently
+     Closed
    - port cargo after filesystem/process/env/path behavior is boringly reliable
    - port rustc last, after large files, lots of memory, process spawning, and
      `std` behavior are dependable
@@ -639,20 +866,43 @@ RYMOS is early but on the right route. Roughly:
   also builds through nightly `build-std` for the custom target.
 - small `no_std` Rust programs: working today.
 - small std-shaped Rust programs: started through `rymos-user::stdish`.
-- small real `std` Rust programs: working today, and now with real breadth,
-  not just "can this work at all": `std` compiles, links, and *runs* for
+- small real `std` Rust programs: working today, with real breadth, not
+  just "can this work at all": `std` compiles, links, and *runs* for
   `x86_64-rymos` via a forked `rust-lang/rust` (`toolchain/rust`), the same
   way other small OSes (Redox, Hermit, ...) got their own PAL support, and
-  `fs`/`env`/`args`/`cwd`/`temp_dir`/`Instant`-ordering/`random` are real
-  now too (see Recently Closed) -- verified live in QEMU with a `stdreal`
-  program touching all of them plus `println!`/`Vec`/`HashMap`/iterators.
-  What's left: `std::process::Command` (a real design mismatch, not a
-  wiring gap), `Instant` duration arithmetic (needs tick calibration,
-  category 4), and turning the one hand-built `stdreal` test into a
-  repeatable build pipeline.
-- `cargo`: still far; needs `std::process::Command` (currently a deliberate,
-  documented gap -- see Recently Closed) plus the stronger process,
-  filesystem, env, time, and path behavior category 2-4 still have open.
+  `fs`/`env`/`args`/`cwd`/`temp_dir`/`Instant`/`SystemTime`/`sleep`/`random`/
+  `process::Command` are all real now (see Recently Closed) -- verified live
+  in QEMU with a `stdreal` program touching all of them, including spawning
+  a real child via `Command::output()`/`.status()`, plus
+  `println!`/`Vec`/`HashMap`/iterators. `stdreal` also has a real,
+  repeatable build pipeline now (`RYMOS_TARGET_MODE=std`), not a hand-built
+  one-off. What's left at the `std` layer: `Command::spawn()` +
+  interactive `Child::stdin` writes (needs real concurrent execution, not
+  more wiring -- see category 2), and broader errno detail beyond the basic
+  `ERR_*` set already mapped.
+- `cargo`: still far, but the two blockers flagged as "the last major
+  stretch" are closed: `std::process::Command` is real, and `stdreal` has a
+  repeatable build pipeline. A first cargo-shaped smoke test (`cargolike`)
+  also ran live and found three real gaps a hand-written `stdreal`-style
+  program alone hadn't exercised -- a 1 KiB pipe buffer that silently
+  truncated large captured child output, an 8-slot env table that aborted
+  the whole process (not just the failing call) once a real cargo child's
+  env var count would exceed it, and file mtimes that were never wired up
+  even though the kernel already tracked them -- all three now fixed (see
+  Recently Closed). A follow-up nested-spawn test (`relay`) found three more
+  real, layered bugs that would have blocked a genuine cargo port outright
+  (cargo invoking rustc, which itself shells out to a linker, is exactly a
+  nested `Command` chain) -- pipe-slot exhaustion, a `dup2`-based
+  stdio-restore bug that silently dropped a nested child's output to the
+  console instead of its actual caller's pipe, and a kernel-stack-cost bug
+  in `app_restore_after_spawn` that hung (not crashed) a deep chain. All
+  three are now fixed and verified live: a 4-level nested `Command` chain
+  through `cargolike`'s `std::process::Command` completes cleanly with every
+  level's output correctly propagated to the top. What remains is the
+  actual scale/reliability work category 2-4 still have open (real
+  concurrent execution, unbounded directory growth, richer path
+  normalization), plus running further, larger cargo-like helper programs to
+  find out what else is needed beyond what `cargolike`/`relay` covered.
 - `rustc`: very far; needs all of `cargo`'s foundations plus much stronger
   memory management, large files, many descriptors, and reliable child process
   execution.
