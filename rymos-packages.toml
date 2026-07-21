@@ -90,3 +90,19 @@ bin = "relay"
 source = "programs/relay"
 install = "programs/relay.elf"
 enabled = true
+
+[[program]]
+name = "preemptest"
+package = "rymos-program-preemptest"
+bin = "preemptest"
+source = "programs/preemptest"
+install = "programs/preemptest.elf"
+enabled = true
+
+[[program]]
+name = "ticker"
+package = "rymos-program-ticker"
+bin = "ticker"
+source = "programs/ticker"
+install = "programs/ticker.elf"
+enabled = true

@@ -12,10 +12,12 @@ members = [
   "programs/fswalk",
   "programs/heapstress",
   "programs/hello",
+  "programs/preemptest",
   "programs/relay",
   "programs/rysh",
   "programs/stdreal",
   "programs/stdshim",
+  "programs/ticker",
 ]
 exclude = ["toolchain/rust"]
 resolver = "3"

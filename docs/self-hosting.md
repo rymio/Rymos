@@ -252,6 +252,142 @@ See `docs/rust-port-roadmap.md` for the detailed cargo/rustc port sequence.
   into Stage 2's reschedule core, so two backgrounded programs can produce
   genuinely interleaved output) is Stage 3b, still ahead.
 
+- **Real preemption (category 2, stage 3b of the scheduler work) -- the
+  actual "run programs as daemons" deliverable**: the timer ISR now calls a
+  new `maybe_preempt` on every tick, which reuses stage 2's `pick_next_ready`
+  and `switch_to` completely unchanged. This works because `switch_to` is a
+  plain Rust function: calling it from deep inside `timer_tick_isr` (itself
+  called from `irq0_stub` via an ordinary SysV `call`, after the interrupted
+  task's entire register state is already saved by `irq0_stub`'s prologue)
+  is no different, at the ABI level, from calling it from a voluntary
+  `wait`/`wait_any` yield -- no new context representation, no rewrite of
+  `context_switch`, and no change to how a brand-new process's initial stack
+  frame is built. `switch_to`'s own bookkeeping (state transition, `CR3`,
+  `CURRENT_PROCESS_INDEX`) is now wrapped in `without_interrupts`, since a
+  *second* tick landing mid-handoff (after `CURRENT_PROCESS_INDEX` updates
+  but before the register swap) would otherwise see a torn state and try to
+  switch again on top of it -- not "interrupts stay off for as long as this
+  call is suspended," since each task's own suspended call frame carries its
+  own independent restore point and re-enables interrupts the moment *it*
+  resumes (see `switch_to`'s docs). `PHYS_ALLOCATOR`'s `alloc_page`/
+  `free_page` and `process_spawn_with_argv`'s pid/slot allocation -- the
+  concrete shared structures the plan named as at-risk once preemption is
+  real, not just plumbing -- got the same treatment; a full kernel-wide audit
+  of every remaining touch point (page-table edits during spawn/exit,
+  console output) is *not* claimed here and stays a disclosed, known gap
+  (console serialization is explicitly Stage 4's job; see What Is Left).
+
+  Two real bugs surfaced live and were fixed before this was safe, both
+  invisible under Stage 2's purely cooperative scheduling because nothing
+  ever rescheduled asynchronously there:
+  - **A newly spawned process was schedulable before it was actually
+    prepared.** `process_spawn_with_argv` marked a freshly claimed table
+    slot `Ready` immediately, but `context.rsp` only becomes real once
+    `prepare_process` finishes (address space, ELF load, kernel stack,
+    initial frame) moments later. Under Stage 2 this window was harmless --
+    nothing ever called the scheduler asynchronously during it. Under real
+    preemption, a tick landing in that exact window could pick the
+    half-prepared process and switch to `context.rsp == 0`. Confirmed live:
+    a page fault at `RSP=0` cascading through a double fault into a silent
+    triple fault (`-no-reboot` just stops the vCPU, no diagnostic ever
+    printed -- traced via `qemu -d int`'s own CPU-state dump, since the
+    kernel's own fault handler never got a chance to run). Fixed with a new
+    `ProcessState::Loading`, distinct from `Ready`: `process_spawn_with_argv`
+    claims the slot as `Loading`, and only `prepare_process`'s existing
+    end-of-setup `Ready` transition makes it schedulable.
+  - **A freshly started process silently inherited permanently-disabled
+    interrupts.** `context_switch` never touches `RFLAGS` (deliberately not
+    part of `CpuContext`), and a brand-new process arrives at
+    `process_trampoline` via a plain `ret`, not `iretq` -- there's no saved
+    `RFLAGS` to restore. Whatever `IF` happened to be set on whoever last
+    called `switch_to` into it (disabled, if a preemptive tick is what
+    triggered the switch) just carried over, with nothing left anywhere in
+    that process's call chain to ever turn interrupts back on for it.
+    Confirmed live: two fire-and-forget daemons that should have interleaved
+    instead ran fully sequentially (200 lines from the first, then 200 from
+    the second) -- the first daemon's *entire* run happened with interrupts
+    permanently off, so no tick ever fired to preempt it. Fixed with an
+    unconditional `sti` as the very first instruction in
+    `process_trampoline`.
+
+  Verified live in QEMU with a new `preemptest` program (two fire-and-forget
+  `spawn`s of a busy-sleep-and-print child, no voluntary yield in the loop --
+  only real preemption lets the other one run any of its own iterations):
+  after both fixes, output showed sustained, genuine interleaving (small
+  alternating runs like `A:191 / A:192 / B:193 / B:194 / A:193 / A:194 /
+  B:195 ...` throughout, not one daemon finishing before the other starts),
+  both exiting `0`, alongside the full existing regression suite -- Stage
+  2's `echoin`/rysh scenario, `cmdapi`'s spawn-many/zombie checks, `fswalk`,
+  `heapstress`, `stdshim` -- passing unchanged. A handful of `preemptest`'s
+  print lines landed glued together mid-line in the serial log (e.g.
+  `A:192B:193`) -- expected and harmless: two genuinely interleaved writes to
+  the one shared `Console` with no serialization between them yet, exactly
+  the known gap Stage 4 is scoped to close, not a scheduling bug.
+
+- **Daemon ergonomics + console serialization (category 2, stage 4 of the
+  scheduler work) -- the last stage: "run programs as daemons" is now
+  actually done and dusted.** Two deliverables, matching the plan's own
+  split:
+  - **Console output no longer garbles under real preemption.**
+    `Console::write_bytes` -- the one choke point every process's ABI
+    `write`/`write_fd` call to `STDOUT`/`STDERR` goes through -- is now
+    wrapped in `without_interrupts`, so a preemptive tick can't land
+    mid-call and let a *different* process's write splice bytes into this
+    one. This makes each individual `write`/`write_fd` call atomic; it
+    deliberately does *not* make a multi-call sequence from one caller (a
+    `print` followed by a separate `write(b"\n")`, the exact pattern
+    `preemptest` used, on purpose, to prove raw interleaving in stage 3b)
+    atomic as a whole -- a caller that wants a whole line to survive should
+    build it into one buffer and make one write call, the same discipline
+    real Unix programs follow for the same reason. This is a deliberately
+    scoped fix ("a short critical section around each console write," per
+    the plan), not a claim that every possible interleaving pattern is now
+    clean.
+  - **A real `daemon <program> <args>` builtin in rysh**, alongside a new
+    `sleep <ms>` builtin (a thin `sleep_nanos` wrapper, needed to write a
+    demo that visibly spans real time). `daemon` is functionally identical
+    to the existing `spawn` builtin -- `spawn` already enqueues a child and
+    returns immediately (stage 2), and real preemption (stage 3b) is what
+    actually lets it keep making progress -- but named for what it's
+    actually for, so scripts reach for the right builtin instead of `spawn`
+    (whose name reads as "run this," not "background this"). The caller
+    still owns eventually `wait`ing on the pid it prints, same as any other
+    spawned child, so it doesn't become a permanent unreaped zombie.
+
+  Verified live in QEMU with a new `ticker` program (prints "<tag>:<i>"
+  periodically, each line built into one buffer before a single `write`
+  call -- the buffering discipline `Console::write_bytes`'s docs describe)
+  and a small rysh script (`build/daemon-demo.rym`): `daemon ticker T 15 10`
+  backgrounds it, then rysh immediately continues with ten of its own
+  `print`/`sleep 10` pairs before finally `wait`ing. The serial log showed
+  clean, fully alternating interleaving the whole way through --
+  `still responsive 1` / `T:0` / `still responsive 2` / `T:1` / ... -- with
+  no glued-together lines this time (unlike stage 3b's `preemptest`, which
+  deliberately didn't buffer), the ticker continuing on its own (`T:9`
+  through `T:14`) once rysh ran out of its own ten lines, and a clean
+  `pid 24 exited exit 0` / `daemon demo: ticker reaped` once `wait` collected
+  it -- alongside the full existing regression suite passing unchanged.
+  This is the actual, literal deliverable the whole category 2 effort was
+  for: a shell that stays responsive while a backgrounded program keeps
+  making progress on its own.
+
+  Explicitly not attempted, staying disclosed rather than silently
+  papered over: a full kernel-wide audit of every shared-state touch point
+  beyond what stage 3b already found and fixed empirically (`PHYS_ALLOCATOR`,
+  the pid/slot allocator, `switch_to`'s own bookkeeping) -- page-table edits
+  during spawn/exit in particular haven't been individually reviewed for
+  preemption-safety, since nothing has yet exercised a workload that hits
+  them concurrently with another preemptible task. Round-robining the
+  reserved idle/console slot back into `pick_next_ready`'s rotation was
+  never needed and wasn't attempted: today's `daemon` primitive works by
+  making the *interactive shell itself* (rysh) a real, ordinary scheduled
+  process, alongside whatever it backgrounds -- both are real
+  `PROCESS_TABLE` slots, so ordinary preemption already alternates between
+  them with no special-casing required. That only covers "a real process
+  backgrounds another real process"; the bare kernel console loop
+  (`PROCESS_COUNT`, before any process ever runs) still can't be preempted
+  back into once it switches away, exactly as stage 3b's docs disclosed.
+
 - **`relay`: a nested-spawn stress test that found and fixed three real,
   layered gaps `cargolike`'s flat, sequential tests couldn't see**:
   `cargolike`'s `repeated_spawn_test` only proved *sequential* spawns (one
@@ -912,10 +1048,31 @@ The remaining blockers are now narrower and more concrete:
      register/stack context -- done: see Recently Closed. `spawn` genuinely
      enqueues and returns; a hand-written `context_switch` plus per-pid
      kernel stacks (with a guard gap) make `wait`/`wait_any` real blocking
-     calls. Still cooperative, not preemptive -- yields only happen at
-     `wait`/`wait_any` and process exit, so two daemons still can't
-     interleave mid-execution. That needs a timer interrupt actually
-     driving the reschedule decision, still ahead.
+     calls. Real preemption is also done now: a timer interrupt (category 2
+     stage 3a/3b, see Recently Closed) actually drives the reschedule
+     decision on every tick, verified with two genuinely interleaved
+     fire-and-forget daemons. Daemon ergonomics and console serialization
+     (category 2 stage 4, see Recently Closed) are done too: a real
+     `daemon <program> <args>` rysh builtin backgrounds a program without
+     waiting on it, `Console::write_bytes` is now `without_interrupts`-wrapped
+     so one process's write can't be spliced mid-call by another's, and a
+     shell script backgrounding a periodic printer while continuing its own
+     work showed clean, fully alternating interleaving with no glued-together
+     output -- the actual, literal "run programs as daemons" deliverable
+     this whole effort was for. Still open: the timer ISR only calls
+     `pick_next_ready`/`switch_to`, both already IF-safe, but a full audit of
+     *every* other shared-state touch point in the kernel (page-table edits
+     during spawn/exit, in particular) hasn't been done -- only
+     `PHYS_ALLOCATOR` and the pid/slot allocator got explicit protection,
+     since those were the two concretely, empirically found to matter (see
+     Recently Closed). Console serialization only covers one call at a
+     time, not a whole multi-call sequence from one caller -- a caller that
+     wants a whole line to survive must buffer it into one write, same as
+     real Unix programs. The reserved idle/console slot still can't be
+     round-robined back into once switched away from -- today's `daemon`
+     works because the interactive shell (rysh) is itself a real scheduled
+     process alongside whatever it backgrounds, not because the bare kernel
+     console loop gained that ability.
    - add relocatable/PIE program loading (unrelated to the isolation work
      above, which keeps every process at the same virtual address)
    - add real `exec`

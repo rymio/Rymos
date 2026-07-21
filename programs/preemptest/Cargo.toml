@@ -1,0 +1,12 @@
+[package]
+name = "rymos-program-preemptest"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+rymos-user = { path = "../../runtime/rymos-user" }
+
+[[bin]]
+name = "preemptest"
+path = "src/main.rs"

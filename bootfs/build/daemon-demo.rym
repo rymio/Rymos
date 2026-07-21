@@ -1,0 +1,26 @@
+# RYMOS category 2 stage 4 verification: background a periodic printer
+# via the daemon builtin, then keep issuing other shell commands while
+# it runs, proving the shell stays responsive instead of blocking on it.
+print daemon demo: backgrounding a ticker
+daemon ticker T 15 10
+print still responsive 1
+sleep 10
+print still responsive 2
+sleep 10
+print still responsive 3
+sleep 10
+print still responsive 4
+sleep 10
+print still responsive 5
+sleep 10
+print still responsive 6
+sleep 10
+print still responsive 7
+sleep 10
+print still responsive 8
+sleep 10
+print still responsive 9
+sleep 10
+print still responsive 10
+wait
+print daemon demo: ticker reaped

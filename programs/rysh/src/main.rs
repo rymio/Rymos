@@ -193,8 +193,15 @@ fn run_line(line: &[u8], line_no: usize, args: &[u8], store: &mut VarStore) {
             let (name, args) = split_word(rest);
             spawn(name, args);
         }
+        b"daemon" => {
+            let (name, args) = split_word(rest);
+            daemon(name, args);
+        }
         b"wait" => {
             wait_process(rest);
+        }
+        b"sleep" => {
+            sleep_ms(rest);
         }
         b"time" => {
             time_ticks();
@@ -675,6 +682,42 @@ fn spawn(name: &[u8], args: &[u8]) {
             rt::write(b"\n");
         }
     }
+}
+
+/// Category 2 stage 4's daemon-ergonomics deliverable: a clearly-named way
+/// to start a program running in the background without waiting on it.
+/// Functionally identical to `spawn` -- `spawn` already enqueues the child
+/// and returns immediately (category 2 stage 2), and real preemption
+/// (stage 3b) is what actually lets it keep making progress interleaved
+/// with whatever rysh does next -- but named for what it's actually for, so
+/// scripts reach for the right builtin instead of `spawn` (whose name reads
+/// as "run this," not "background this"). The caller is still responsible
+/// for eventually `wait`ing on the pid this prints, same as any other
+/// spawned child, so it doesn't become a permanent unreaped zombie.
+fn daemon(name: &[u8], args: &[u8]) {
+    match rt::spawn(name, args) {
+        Ok(pid) => {
+            rt::print("daemon started pid ");
+            rt::print_usize(pid as usize);
+            rt::write(b"\n");
+        }
+        Err(-2) => {
+            rt::print("rysh: daemon waits for isolated app loading\n");
+        }
+        Err(code) => {
+            rt::print("rysh: daemon failed ");
+            print_i32(code);
+            rt::write(b"\n");
+        }
+    }
+}
+
+fn sleep_ms(text: &[u8]) {
+    let Some(ms) = parse_u32(text) else {
+        rt::print("rysh: invalid sleep duration\n");
+        return;
+    };
+    rt::sleep_nanos(ms as u64 * 1_000_000);
 }
 
 fn wait_process(pid: &[u8]) {

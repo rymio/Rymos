@@ -71,6 +71,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rymos-program-preemptest"
+version = "0.1.0"
+dependencies = [
+ "rymos-user",
+]
+
+[[package]]
 name = "rymos-program-relay"
 version = "0.1.0"
 dependencies = [
@@ -90,6 +97,13 @@ version = "0.1.0"
 
 [[package]]
 name = "rymos-program-stdshim"
+version = "0.1.0"
+dependencies = [
+ "rymos-user",
+]
+
+[[package]]
+name = "rymos-program-ticker"
 version = "0.1.0"
 dependencies = [
  "rymos-user",

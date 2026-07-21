@@ -332,6 +332,19 @@ enum ProcessState {
     /// `pick_next_ready` -- only `wake_waiters_for` moves a process back to
     /// `Ready`, when whatever it's waiting on actually exits.
     Blocked = 5,
+    /// A table slot has been claimed (a pid assigned, name/args recorded)
+    /// but `prepare_process` hasn't finished setting up its address space,
+    /// kernel stack, and initial `CpuContext` yet -- deliberately distinct
+    /// from `Ready` so `pick_next_ready`/category 2 stage 3b's preemptive
+    /// tick can never pick it mid-setup. Under Stage 2's purely cooperative
+    /// scheduling this in-between window was harmless (nothing ever
+    /// rescheduled asynchronously); real preemption made it a live, real
+    /// bug -- a tick landing in that exact window could switch to a
+    /// still-zeroed `context.rsp`, faulting immediately (found live: a
+    /// page fault at `RSP=0`, cascading to a double and then triple fault
+    /// with no diagnostic ever printed). `prepare_process` moves a slot
+    /// from `Loading` to `Ready` only once `context.rsp` is real.
+    Loading = 6,
 }
 
 /// What a `Blocked` process is waiting for -- see `abi_wait`/`abi_wait_any`.
@@ -1099,10 +1112,24 @@ impl Console {
         self.write_bytes(text.as_bytes());
     }
 
+    /// Category 2 stage 4: the one choke point every process's ABI
+    /// `write`/`write_fd` call to `STDOUT`/`STDERR` goes through
+    /// (`abi_write`). Wrapped in `without_interrupts` so a preemptive tick
+    /// can't land mid-call and let a *different* process's own write splice
+    /// bytes into this one -- confirmed live under stage 3b before this fix:
+    /// two daemons' lines landed glued together (`A:192B:193`, no newline
+    /// between them). This makes each individual `write`/`write_fd` call
+    /// atomic; it does *not* make a multi-call sequence from one caller
+    /// (e.g. a `print` followed by a separate `write(b"\n")`) atomic as a
+    /// whole -- callers that care about a whole line staying together
+    /// should build it into one buffer and make one write call, the same
+    /// discipline real Unix programs follow for the same reason.
     fn write_bytes(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.write_byte(*byte);
-        }
+        without_interrupts(|| {
+            for byte in bytes {
+                self.write_byte(*byte);
+            }
+        });
     }
 
     fn write_byte(&mut self, byte: u8) {
@@ -1887,13 +1914,18 @@ fn process_spawn(name: &[u8], args: &[u8]) -> Option<usize> {
     process_spawn_with_argv(name, args, &argv[..argv_count], parent_pid)
 }
 
+/// Wrapped in `without_interrupts`: allocating a pid and a `PROCESS_TABLE`
+/// slot is a multi-step read-modify-write over exactly the shared state
+/// category 2 stage 3b's real preemption made newly risky -- a tick landing
+/// between the `NEXT_PID` bump and the slot claim (or between two
+/// concurrent spawns) could otherwise hand out the same pid or slot twice.
 fn process_spawn_with_argv(
     name: &[u8],
     args: &[u8],
     argv: &[ArgSlice],
     parent_pid: u32,
 ) -> Option<usize> {
-    unsafe {
+    without_interrupts(|| unsafe {
         let table = &raw mut PROCESS_TABLE;
         let pid = NEXT_PID;
         NEXT_PID = NEXT_PID.wrapping_add(1);
@@ -1908,7 +1940,11 @@ fn process_spawn_with_argv(
             *process = Process::empty();
             process.pid = pid;
             process.parent_pid = parent_pid;
-            process.state = ProcessState::Ready;
+            // Not `Ready` yet -- `context.rsp` is still the zeroed value
+            // `Process::empty()` set; `prepare_process` moves this to
+            // `Ready` only once it's real. See `ProcessState::Loading`'s
+            // docs for the exact bug this closes.
+            process.state = ProcessState::Loading;
             process.name_len = min(name.len(), PROCESS_NAME_MAX);
             process.name[..process.name_len].copy_from_slice(&name[..process.name_len]);
             process.args_len = min(args.len(), PROCESS_ARGS_MAX);
@@ -1921,8 +1957,8 @@ fn process_spawn_with_argv(
             }
             return Some(index);
         }
-    }
-    None
+        None
+    })
 }
 
 fn raw_args_to_argv(args: &[u8], argv: &mut [ArgSlice; PROCESS_ARGV_COUNT_MAX]) -> usize {
@@ -2264,6 +2300,7 @@ fn process_state_name(state: ProcessState) -> &'static str {
         ProcessState::Exited => "exited",
         ProcessState::Failed => "failed",
         ProcessState::Blocked => "blocked",
+        ProcessState::Loading => "loading",
     }
 }
 
@@ -2274,6 +2311,7 @@ fn process_state_from_u32(state: u32) -> ProcessState {
         3 => ProcessState::Exited,
         4 => ProcessState::Failed,
         5 => ProcessState::Blocked,
+        6 => ProcessState::Loading,
         _ => ProcessState::Empty,
     }
 }
@@ -2908,20 +2946,30 @@ fn reclaim_process_stack(pid: u32) {
     }
 }
 
+/// `PHYS_ALLOCATOR`'s free-list/count is exactly the kind of shared,
+/// multi-step-mutated state category 2 stage 3b's real preemption made
+/// newly risky: a tick landing mid-`alloc_page`/`free_page` (torn between,
+/// say, popping the reusable-free stack and decrementing its count) could
+/// hand the CPU to a different task that also allocates/frees, corrupting
+/// it. `without_interrupts` wraps only the allocator call itself, not the
+/// zeroing of an already-exclusively-owned fresh page (nothing else can
+/// touch that page until this function hands it back).
 fn alloc_zeroed_page() -> Option<u64> {
-    unsafe {
+    let page = without_interrupts(|| unsafe {
         let allocator = &mut *core::ptr::addr_of_mut!(PHYS_ALLOCATOR);
-        let page = allocator.alloc_page()?;
+        allocator.alloc_page()
+    })?;
+    unsafe {
         write_bytes(page as *mut u8, 0, PAGE_SIZE as usize);
-        Some(page)
     }
+    Some(page)
 }
 
 fn free_phys_page(phys: u64) -> bool {
-    unsafe {
+    without_interrupts(|| unsafe {
         let allocator = &mut *core::ptr::addr_of_mut!(PHYS_ALLOCATOR);
         allocator.free_page(phys)
-    }
+    })
 }
 
 fn page_is_zeroed(page: u64) -> bool {
@@ -3160,8 +3208,24 @@ unsafe extern "sysv64" fn context_switch(prev: *mut CpuContext, next: *const Cpu
 /// something *else* later switches back to whichever index called this --
 /// see `context_switch`'s docs. Handles the CR3 switch too (the idle slot's
 /// `pml4_phys` is always 0, meaning "use the shared kernel PML4").
+///
+/// The bookkeeping (state transition, `CURRENT_PROCESS_INDEX`, `CR3`) plus
+/// the `context_switch` call itself is wrapped in `without_interrupts` --
+/// category 2 stage 3b's timer tick can now call this from an ISR that
+/// preempts a task genuinely mid-instruction, and a *second* tick landing
+/// between (say) `CURRENT_PROCESS_INDEX`'s update and the actual register
+/// swap would see a half-updated handoff and try to switch again on top of
+/// it. This is *not* "interrupts stay off for as long as this call is
+/// suspended" -- once `context_switch` resumes a *different* task's own
+/// earlier call to this same function, that task's own `without_interrupts`
+/// (a plain local variable on its own per-process kernel stack, per
+/// category 2 stage 2) restores interrupts right where *it* left off,
+/// immediately after its own `context_switch` call. Each suspended call
+/// site carries its own independent restore point; nothing here disables
+/// interrupts for the outside world any longer than the handoff itself
+/// takes.
 fn switch_to(next_index: usize) {
-    unsafe {
+    without_interrupts(|| unsafe {
         let table = &raw mut PROCESS_TABLE;
         if next_index < PROCESS_COUNT {
             (*table)[next_index].state = ProcessState::Running;
@@ -3180,7 +3244,7 @@ fn switch_to(next_index: usize) {
         let prev_ctx = core::ptr::addr_of_mut!((*table)[prev_index].context);
         let next_ctx = core::ptr::addr_of!((*table)[next_index].context);
         context_switch(prev_ctx, next_ctx);
-    }
+    });
     // However this particular call to `switch_to` returned -- resumed
     // later, on a genuinely different stack than whatever most recently
     // exited -- it's always safe right here to reclaim any exited
@@ -3325,7 +3389,23 @@ fn exit_and_yield(exit_index: usize, code: i32) -> ! {
 /// whatever later calls `pick_next_ready`, regardless of whether its
 /// original parent already exited -- there is no nested call stack relying
 /// on it finishing first anymore.
+///
+/// `sti` first, unconditionally: `context_switch` never touches `RFLAGS`
+/// (it's not part of `CpuContext`, by design -- see its docs), and a
+/// brand-new process arrives here via a plain `ret`, not `iretq`, so there
+/// is no saved `RFLAGS` to restore in the first place. Without this, a
+/// freshly-started process silently inherits whatever `IF` happened to be
+/// set on whoever last called `switch_to` into it -- which, the moment
+/// category 2 stage 3b's preemptive tick is what triggered that switch, is
+/// *disabled* (the interrupt gate clears `IF` on entry and nothing
+/// re-enables it until some suspended `without_interrupts` frame resumes).
+/// Found live: two fire-and-forget daemons that should have interleaved
+/// ran fully sequentially instead -- the first one's entire run happened
+/// with interrupts permanently off, so no tick ever fired to preempt it.
 extern "sysv64" fn process_trampoline() -> ! {
+    unsafe {
+        asm!("sti", options(nomem, nostack, preserves_flags));
+    }
     let index = unsafe { CURRENT_PROCESS_INDEX };
     let (entry, pid, pml4_phys) = unsafe {
         let table = &raw const PROCESS_TABLE;
@@ -7100,6 +7180,45 @@ extern "sysv64" fn timer_tick_isr() {
         TIMER_TICKS += 1;
         outb(PIC1_COMMAND, PIC_EOI);
     }
+    // EOI first, always -- the PIC won't raise IRQ0 again until it sees
+    // this, regardless of whether we're about to hand the CPU to a
+    // different task entirely.
+    maybe_preempt();
+}
+
+/// Category 2 stage 3b: the actual scheduling decision on tick, not just
+/// plumbing. Called from `irq0_stub` via `timer_tick_isr`, which is a plain
+/// SysV call site like any other -- `switch_to`/`context_switch` need no
+/// changes at all to be called from here (see `switch_to`'s docs): the
+/// interrupted task's entire register state is already saved on its own
+/// stack by `irq0_stub`'s prologue before this Rust code ever runs, exactly
+/// like a normal function call boundary from the compiler's point of view.
+///
+/// Only ever preempts a task that's still genuinely `Running` -- if the
+/// current index is mid-transition (a voluntary yield already changed its
+/// own state to `Blocked`/`Exited` and is about to call `switch_to` itself)
+/// a stale tick landing in that narrow window must not clobber the
+/// transition it just made or double-switch on top of it. The reserved
+/// idle/console slot (`PROCESS_COUNT`) has no tracked state, so it's always
+/// eligible to be preempted away from, but is never itself a candidate
+/// `pick_next_ready` returns (see its docs) -- this stage does not attempt
+/// round-robining back to it once switched away; that's Stage 4's explicit
+/// console-responsiveness work, not this checkpoint's bar (see the plan).
+fn maybe_preempt() {
+    without_interrupts(|| unsafe {
+        let table = &raw mut PROCESS_TABLE;
+        let current = CURRENT_PROCESS_INDEX;
+        if current < PROCESS_COUNT && (*table)[current].state != ProcessState::Running {
+            return;
+        }
+        let Some(next) = pick_next_ready() else {
+            return;
+        };
+        if current < PROCESS_COUNT {
+            (*table)[current].state = ProcessState::Ready;
+        }
+        switch_to(next);
+    });
 }
 
 #[unsafe(naked)]

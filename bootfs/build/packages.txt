@@ -11,3 +11,5 @@ heapstress rymos-program-heapstress heapstress bootfs/programs/heapstress.elf
 stdshim rymos-program-stdshim stdshim bootfs/programs/stdshim.elf
 bigoutput rymos-program-bigoutput bigoutput bootfs/programs/bigoutput.elf
 relay rymos-program-relay relay bootfs/programs/relay.elf
+preemptest rymos-program-preemptest preemptest bootfs/programs/preemptest.elf
+ticker rymos-program-ticker ticker bootfs/programs/ticker.elf
