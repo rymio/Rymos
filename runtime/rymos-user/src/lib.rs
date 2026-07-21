@@ -1064,15 +1064,24 @@ fn run_command_output(
     }
 
     let spawn_result = spawn_command(name, args, argv);
-    restore_stdio(saved_stdio);
-    restore_command_context(
-        command_cwd,
-        &saved_cwd_buffer[..saved_cwd_len],
-        &env_restores,
-    );
+    // `spawn` only enqueues the child now (category 2's scheduler work) --
+    // it may not have actually run yet, so `wait` must happen *before*
+    // reverting this redirection, not after. Reverting first would mean
+    // the child (once it does run, driven by `wait` itself) writes to
+    // whatever stdio was reverted to instead of these pipes -- exactly the
+    // bug a genuinely deferred spawn model was reverted over earlier this
+    // session, now fixed for real since `wait` actually drives the
+    // scheduler rather than being a lookup against an already-finished
+    // child.
     let pid = match spawn_result {
         Ok(pid) => pid,
         Err(code) => {
+            restore_stdio(saved_stdio);
+            restore_command_context(
+                command_cwd,
+                &saved_cwd_buffer[..saved_cwd_len],
+                &env_restores,
+            );
             close_many(&[
                 stdin_read,
                 stdin_write,
@@ -1088,6 +1097,12 @@ fn run_command_output(
     let status = match wait(pid) {
         Some(status) => status,
         None => {
+            restore_stdio(saved_stdio);
+            restore_command_context(
+                command_cwd,
+                &saved_cwd_buffer[..saved_cwd_len],
+                &env_restores,
+            );
             close_many(&[
                 stdin_read,
                 stdin_write,
@@ -1099,6 +1114,12 @@ fn run_command_output(
             return Err(ERR_NOENT);
         }
     };
+    restore_stdio(saved_stdio);
+    restore_command_context(
+        command_cwd,
+        &saved_cwd_buffer[..saved_cwd_len],
+        &env_restores,
+    );
     let stdout = read_all_available(stdout_read);
     let stderr = read_all_available(stderr_read);
     close_many(&[
@@ -1250,20 +1271,21 @@ fn run_command_status(
     }
 
     let spawn_result = spawn_command(name, args, argv);
-    restore_stdio(saved_stdio);
-    restore_command_context(
-        command_cwd,
-        &saved_cwd_buffer[..saved_cwd_len],
-        &env_restores,
-    );
-
-    // `spawn()` only enqueues the child now -- it may not actually run until
-    // `wait()` below gets around to it (see the kernel's `run_ready_task`).
-    // The redirected stdin pipe and stdout/stderr files must stay open until
-    // then, so their teardown happens after `wait()`, not right after spawn.
+    // `spawn()` only enqueues the child now (category 2's scheduler work)
+    // -- it may not actually run until `wait()` below gets around to it, so
+    // the redirection must stay in place (and the redirected stdin pipe/
+    // stdout/stderr files must stay open) until *after* `wait()`, not right
+    // after spawn -- reverting first would mean the child, once it does
+    // run, writes to whatever stdio was reverted to instead of these.
     let pid = match spawn_result {
         Ok(pid) => pid,
         Err(code) => {
+            restore_stdio(saved_stdio);
+            restore_command_context(
+                command_cwd,
+                &saved_cwd_buffer[..saved_cwd_len],
+                &env_restores,
+            );
             if let Some((stdin_read, stdin_write)) = stdin_fds {
                 close_many(&[stdin_read, stdin_write]);
             }
@@ -1276,6 +1298,12 @@ fn run_command_status(
     let status = match wait(pid) {
         Some(status) => status,
         None => {
+            restore_stdio(saved_stdio);
+            restore_command_context(
+                command_cwd,
+                &saved_cwd_buffer[..saved_cwd_len],
+                &env_restores,
+            );
             if let Some((stdin_read, stdin_write)) = stdin_fds {
                 close_many(&[stdin_read, stdin_write]);
             }
@@ -1284,6 +1312,12 @@ fn run_command_status(
             return Err(ERR_NOENT);
         }
     };
+    restore_stdio(saved_stdio);
+    restore_command_context(
+        command_cwd,
+        &saved_cwd_buffer[..saved_cwd_len],
+        &env_restores,
+    );
 
     if let Some((stdin_read, stdin_write)) = stdin_fds {
         close_many(&[stdin_read, stdin_write]);

@@ -46,16 +46,18 @@ const APP_FD_BASE: i32 = 3;
 // A nested `Command` chain (e.g. cargo -> rustc -> linker) therefore needs
 // 3 slots *per link still blocked*, not just 3 total: a realistic chain is
 // already 2-3 links by the time the innermost one runs. 12 comfortably
-// covers that with headroom, without growing each `AppStateSnapshot`'s
-// embedded pipes array (and therefore the kernel stack cost of every nested
-// spawn level -- see `AppStateSnapshot`) enough to risk much deeper chains.
-// (A previously-suspected second bug here -- nested redirection silently
+// covers that with headroom. (`APP_PIPES` is a genuinely shared, ambient
+// table -- not per-process -- so raising this no longer has any kernel
+// stack cost per nested spawn level; that concern applied to the old
+// `AppStateSnapshot` save/restore-around-spawn design, which category 2's
+// scheduler work replaced with real per-process state on `Process` and a
+// context switch that's just "change which index is current," not a copy.
+// A previously-suspected second bug here -- nested redirection silently
 // losing data or hanging once enough slots existed for a chain to actually
 // proceed -- turned out to be a real but separate bug in `dup2`-based stdio
 // restore, not in this pipe table; see `abi_std_fd`'s docs and
-// `docs/self-hosting.md`'s Recently Closed. Fixing that is what actually
-// unblocked raising this.) Deeper nesting still hits this ceiling with a
-// clean `ERR_NOSPC`, not a crash.
+// `docs/self-hosting.md`'s Recently Closed.) Deeper nesting still hits this
+// ceiling with a clean `ERR_NOSPC`, not a crash.
 const APP_PIPE_COUNT: usize = 12;
 const APP_PIPE_BUFFER_SIZE: usize = 8192;
 const STDIN_FD: i32 = 0;
@@ -144,6 +146,20 @@ const USER_MMAP_BASE: u64 = 0xFFFF_A000_0000_0000;
 const USER_MMAP_STRIDE: u64 = 1024 * 1024 * 1024;
 const USER_MMAP_SIZE: u64 = 768 * 1024 * 1024;
 const USER_MMAP_MAX_PAGES_PER_CALL: usize = 16384;
+/// Per-pid kernel stack window (category 2's scheduler work), same
+/// fixed-address-slice pattern as the heap/mmap windows above. Unlike
+/// those, a stack has no software bump-pointer limit check -- every
+/// `push`/`call` decrements RSP unconditionally, and this kernel has no
+/// guard pages anywhere -- so each pid's window is deliberately made much
+/// larger (`KERNEL_STACK_STRIDE`, one whole PD entry's span) than the
+/// actual mapped stack (`KERNEL_STACK_PAGES`, mapped at the *top* of that
+/// span, growing down): the unmapped lower portion of the same span is the
+/// guard gap. An overflow big enough to eat through it hits a clean #PF
+/// (already diagnosed-and-halted by the existing exception handler)
+/// instead of silently corrupting the next pid's stack.
+const KERNEL_STACK_BASE: u64 = 0xFFFF_B000_0000_0000;
+const KERNEL_STACK_STRIDE: u64 = 2 * 1024 * 1024;
+const KERNEL_STACK_PAGES: usize = 32;
 const MEM_MAP_GUARD: u32 = 1;
 const APP_LOAD_MIN: u64 = 0x200000;
 const APP_LOAD_MAX: u64 = 0x9000000;
@@ -305,6 +321,39 @@ enum ProcessState {
     Running = 2,
     Exited = 3,
     Failed = 4,
+    /// Voluntarily yielded inside `wait`/`wait_any` because its target
+    /// hasn't exited yet (category 2's scheduler work). Never picked by
+    /// `pick_next_ready` -- only `wake_waiters_for` moves a process back to
+    /// `Ready`, when whatever it's waiting on actually exits.
+    Blocked = 5,
+}
+
+/// What a `Blocked` process is waiting for -- see `abi_wait`/`abi_wait_any`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitTarget {
+    None,
+    Pid(u32),
+    AnyChild,
+}
+
+/// A suspended task's resume point: just the stack pointer. Callee-saved
+/// registers (`rbx`/`rbp`/`r12`-`r15`) live *on* that stack, pushed/popped
+/// by `context_switch` itself -- the classic minimal fiber-switch design,
+/// good enough here since a switch only ever happens at a deliberate call
+/// site (the compiler has already made caller-saved registers dead by
+/// then), not from an arbitrary interrupt. A real interrupt-driven
+/// preemption (category 2, stage 3) needs a separate, *wider* saved-context
+/// type covering every register, since an interrupt can land mid-instruction
+/// with caller-saved registers still live -- not attempted here.
+#[derive(Clone, Copy)]
+struct CpuContext {
+    rsp: u64,
+}
+
+impl CpuContext {
+    const fn empty() -> Self {
+        Self { rsp: 0 }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -329,18 +378,38 @@ struct Process {
     /// been given an isolated address space (falls back to the shared
     /// kernel PML4). See `create_process_address_space`.
     pml4_phys: u64,
-    /// The parent's std-fd/cwd/env redirection state captured at `spawn()`
-    /// time (not run time). `spawn()` only enqueues a child now (see
-    /// `spawn_prepared`/`run_ready_task`) instead of running it inline, but
-    /// `Command`-style helpers still redirect stdio/cwd/env on the *shared*
-    /// ambient globals, spawn, and immediately revert that redirection
-    /// before ever waiting -- so by the time the child actually runs it must
-    /// see the redirection as it was at spawn time, not whatever the caller
-    /// (or anything it does afterward) has left the globals as since.
-    inherited_std_fds: [i32; 3],
-    inherited_cwd: [u8; APP_CWD_MAX],
-    inherited_cwd_len: usize,
-    inherited_env: [AppEnvVar; APP_ENV_COUNT],
+    /// Real per-process ABI state (category 2's scheduler work) -- this
+    /// process's own std-fd redirection, cwd, environment, last error, and
+    /// heap/mmap bump-allocator progress. A spawned child's `std_fds`/`cwd`/
+    /// `env` are copied from the parent's *current* values at `spawn()` time
+    /// (see `spawn_prepared`) since `Command`-style helpers redirect stdio/
+    /// cwd/env, spawn, and revert the redirection before ever waiting -- the
+    /// child must see the redirection as it was at spawn time, not whatever
+    /// the caller (or anything it does afterward) leaves these fields as
+    /// since. `heap_base`/`heap_limit`/`mmap_limit` are pure functions of
+    /// `pid` (see `app_set_heap_window`) and never change after being set
+    /// once; `heap_next`/`mmap_next` are the actual bump-pointer progress
+    /// and must persist across a context switch.
+    std_fds: [i32; 3],
+    cwd: [u8; APP_CWD_MAX],
+    cwd_len: usize,
+    env: [AppEnvVar; APP_ENV_COUNT],
+    last_error: i32,
+    heap_next: u64,
+    heap_limit: u64,
+    mmap_next: u64,
+    mmap_limit: u64,
+    /// Saved callee-saved registers + stack pointer for this process's own
+    /// kernel stack (category 2's scheduler work) -- see `CpuContext` and
+    /// `switch_to`. Meaningless while `state` is `Empty`/`Exited`/`Failed`.
+    context: CpuContext,
+    /// The ELF entry point to jump to the *first* time this process is
+    /// switched into -- read by `process_trampoline`, since it runs on this
+    /// process's own stack and can't see the spawning code's locals.
+    entry_point: u64,
+    /// What this process is waiting for, if `state == Blocked`. See
+    /// `abi_wait`/`abi_wait_any`/`wake_waiters_for`.
+    waiting_for: WaitTarget,
 }
 
 #[derive(Clone, Copy)]
@@ -379,41 +448,6 @@ struct AppEnvVar {
     key_len: usize,
     value: [u8; APP_ENV_VALUE_MAX],
     value_len: usize,
-}
-
-/// The ambient per-"current app" state (`APP_FDS`/`APP_PIPES`/etc, all
-/// flat globals since there's no real per-process control block yet -- see
-/// `spawn_prepared`'s docs) saved by value before a synchronous spawn and
-/// restored after, so a child can't see or clobber its caller's fds/pipes/
-/// cwd/env. Copied *by value*, buffers included -- a nested spawn (a child
-/// that itself spawns, e.g. cargo -> rustc -> linker) keeps its caller's
-/// snapshot alive on the kernel's call stack for as long as it's still
-/// running, so the stack cost of *one* nested level is roughly this whole
-/// struct's size, and `N` levels deep costs roughly `N` times that. This is
-/// why `APP_PIPE_BUFFER_SIZE`/`APP_PIPE_COUNT` were raised conservatively
-/// rather than aggressively (see their docs) -- a properly deep fix would
-/// keep large buffers out of this stack-resident struct entirely (e.g.
-/// heap-backed pipes), not attempted here.
-#[derive(Clone, Copy)]
-struct AppStateSnapshot {
-    console: *mut Console,
-    bootfs: BootFs,
-    args_ptr: *const u8,
-    args_len: usize,
-    pid: u32,
-    process_index: usize,
-    fds: [AppFd; APP_FD_COUNT],
-    pipes: [AppPipe; APP_PIPE_COUNT],
-    std_fds: [i32; 3],
-    cwd: [u8; APP_CWD_MAX],
-    cwd_len: usize,
-    env: [AppEnvVar; APP_ENV_COUNT],
-    last_error: i32,
-    heap_base: u64,
-    heap_next: u64,
-    heap_limit: u64,
-    mmap_next: u64,
-    mmap_limit: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -485,10 +519,18 @@ impl Process {
             heap_page_count: 0,
             mappings: [ProcessMapping::empty(); PROCESS_MAPPING_MAX],
             pml4_phys: 0,
-            inherited_std_fds: [STDIN_FD, STDOUT_FD, STDERR_FD],
-            inherited_cwd: [0; APP_CWD_MAX],
-            inherited_cwd_len: 0,
-            inherited_env: [AppEnvVar::empty(); APP_ENV_COUNT],
+            std_fds: [STDIN_FD, STDOUT_FD, STDERR_FD],
+            cwd: [0; APP_CWD_MAX],
+            cwd_len: 0,
+            env: [AppEnvVar::empty(); APP_ENV_COUNT],
+            last_error: ERR_OK,
+            heap_next: 0,
+            heap_limit: 0,
+            mmap_next: 0,
+            mmap_limit: 0,
+            context: CpuContext::empty(),
+            entry_point: 0,
+            waiting_for: WaitTarget::None,
         }
     }
 }
@@ -573,18 +615,21 @@ impl PhysPageAllocator {
 
 static mut APP_CONSOLE: *mut Console = core::ptr::null_mut();
 static mut APP_BOOTFS: BootFs = BootFs::empty();
-static mut APP_ARGS_PTR: *const u8 = core::ptr::null();
-static mut APP_ARGS_LEN: usize = 0;
-static mut APP_PID: u32 = 0;
-static mut APP_PROCESS_INDEX: usize = PROCESS_COUNT;
+/// Index of whichever process is currently executing, into `PROCESS_TABLE`.
+/// `PROCESS_COUNT` (one past the last real slot -- `PROCESS_TABLE` is sized
+/// `PROCESS_COUNT + 1` for exactly this reason) is the reserved "idle/no
+/// process" index: existing `index >= PROCESS_COUNT`-style sentinel checks
+/// throughout this file stay correct unchanged, since real spawns only ever
+/// allocate slots in `0..PROCESS_COUNT` (see `process_find_slot`/
+/// `process_find_reapable_slot`). Per-process ABI state that used to be flat
+/// globals (`args`/`pid`/`std_fds`/`cwd`/`env`/`last_error`/heap+mmap bump
+/// pointers) now lives on `PROCESS_TABLE[CURRENT_PROCESS_INDEX]` itself --
+/// see `Process`'s docs -- so a context switch is just changing this index,
+/// not copying a large struct in and out of flat statics.
+static mut CURRENT_PROCESS_INDEX: usize = PROCESS_COUNT;
 static mut APP_FDS: [AppFd; APP_FD_COUNT] = [AppFd::empty(); APP_FD_COUNT];
 static mut APP_PIPES: [AppPipe; APP_PIPE_COUNT] = [AppPipe::empty(); APP_PIPE_COUNT];
-static mut APP_STD_FDS: [i32; 3] = [STDIN_FD, STDOUT_FD, STDERR_FD];
-static mut APP_CWD: [u8; APP_CWD_MAX] = [0; APP_CWD_MAX];
-static mut APP_CWD_LEN: usize = 0;
-static mut APP_ENV: [AppEnvVar; APP_ENV_COUNT] = [AppEnvVar::empty(); APP_ENV_COUNT];
-static mut APP_LAST_ERROR: i32 = ERR_OK;
-static mut PROCESS_TABLE: [Process; PROCESS_COUNT] = [Process::empty(); PROCESS_COUNT];
+static mut PROCESS_TABLE: [Process; PROCESS_COUNT + 1] = [Process::empty(); PROCESS_COUNT + 1];
 static mut NEXT_PID: u32 = 1;
 static mut KERNEL_BOOT_INFO: *const BootInfo = core::ptr::null();
 static mut PHYS_ALLOCATOR: PhysPageAllocator = PhysPageAllocator::empty();
@@ -603,11 +648,6 @@ static mut BOOT_TSC: u64 = 0;
 /// time is this plus nanoseconds elapsed since `BOOT_TSC`.
 static mut BOOT_UNIX_NANOS: u64 = 0;
 static mut NEXT_SCRATCH_VIRT: u64 = KERNEL_SCRATCH_BASE;
-static mut APP_HEAP_BASE: u64 = 0;
-static mut APP_HEAP_NEXT: u64 = 0;
-static mut APP_HEAP_LIMIT: u64 = 0;
-static mut APP_MMAP_NEXT: u64 = 0;
-static mut APP_MMAP_LIMIT: u64 = 0;
 static ENV: [(&[u8], &[u8]); ENV_COUNT] = [
     (b"PATH", b"programs"),
     (b"HOME", b"/"),
@@ -1835,7 +1875,7 @@ fn pfs_entry_offset(index: usize) -> usize {
 fn process_spawn(name: &[u8], args: &[u8]) -> Option<usize> {
     let mut argv = [ArgSlice::empty(); PROCESS_ARGV_COUNT_MAX];
     let argv_count = raw_args_to_argv(args, &mut argv);
-    let parent_pid = unsafe { APP_PID };
+    let parent_pid = current_pid();
     process_spawn_with_argv(name, args, &argv[..argv_count], parent_pid)
 }
 
@@ -1895,7 +1935,7 @@ fn raw_args_to_argv(args: &[u8], argv: &mut [ArgSlice; PROCESS_ARGV_COUNT_MAX]) 
 }
 
 unsafe fn process_find_slot(
-    table: *mut [Process; PROCESS_COUNT],
+    table: *mut [Process; PROCESS_COUNT + 1],
     state: ProcessState,
 ) -> Option<usize> {
     for index in 0..PROCESS_COUNT {
@@ -1916,7 +1956,7 @@ unsafe fn process_find_slot(
 /// wait exists). Filling the table with genuinely unreaped zombies should
 /// fail spawn with `ERR_NOSPC`, matching real reaping semantics, not quietly
 /// corrupt one of them.
-unsafe fn process_find_reapable_slot(table: *mut [Process; PROCESS_COUNT]) -> Option<usize> {
+unsafe fn process_find_reapable_slot(table: *mut [Process; PROCESS_COUNT + 1]) -> Option<usize> {
     for index in 0..PROCESS_COUNT {
         let process = unsafe { &(*table)[index] };
         if process.waited && matches!(process.state, ProcessState::Exited | ProcessState::Failed) {
@@ -2086,6 +2126,13 @@ fn process_pid(index: usize) -> u32 {
     }
 }
 
+/// The pid of whichever process is currently executing (0 if none -- the
+/// reserved idle slot's `Process::empty()` defaults to pid 0, matching the
+/// old flat `APP_PID`'s "0 means no process" convention).
+fn current_pid() -> u32 {
+    unsafe { process_pid(CURRENT_PROCESS_INDEX) }
+}
+
 fn process_list(console: &mut Console) {
     console.write_line("pid  state    exit  name args");
     unsafe {
@@ -2201,26 +2248,6 @@ fn find_process_index_by_pid(pid: u32) -> Option<usize> {
     None
 }
 
-/// Lowest-pid `Ready` (spawned but not yet actually run) child of `parent_pid`,
-/// if any. `Ready` now means genuinely not started -- see `spawn_prepared` and
-/// `run_ready_task`, which is the deferred-execution model for category 2.
-fn find_ready_child_of(parent_pid: u32) -> Option<usize> {
-    unsafe {
-        let table = &raw const PROCESS_TABLE;
-        let mut best: Option<usize> = None;
-        for index in 0..PROCESS_COUNT {
-            let process = &(*table)[index];
-            if process.parent_pid == parent_pid && matches!(process.state, ProcessState::Ready) {
-                best = match best {
-                    Some(current) if (*table)[current].pid <= process.pid => Some(current),
-                    _ => Some(index),
-                };
-            }
-        }
-        best
-    }
-}
-
 fn process_state_name(state: ProcessState) -> &'static str {
     match state {
         ProcessState::Empty => "empty",
@@ -2228,6 +2255,7 @@ fn process_state_name(state: ProcessState) -> &'static str {
         ProcessState::Running => "running",
         ProcessState::Exited => "exited",
         ProcessState::Failed => "failed",
+        ProcessState::Blocked => "blocked",
     }
 }
 
@@ -2237,6 +2265,7 @@ fn process_state_from_u32(state: u32) -> ProcessState {
         2 => ProcessState::Running,
         3 => ProcessState::Exited,
         4 => ProcessState::Failed,
+        5 => ProcessState::Blocked,
         _ => ProcessState::Empty,
     }
 }
@@ -2447,7 +2476,7 @@ fn ensure_kernel_pml4() -> Option<u64> {
 /// it one, else the shared kernel PML4 (initializing it if this is the very
 /// first process/mapping activity since boot).
 fn current_pml4_or_kernel() -> Option<u64> {
-    let index = unsafe { APP_PROCESS_INDEX };
+    let index = unsafe { CURRENT_PROCESS_INDEX };
     if index < PROCESS_COUNT {
         let pml4 = unsafe {
             let table = &raw const PROCESS_TABLE;
@@ -2713,8 +2742,16 @@ fn create_process_address_space(pid: u32) -> Option<u64> {
     let kernel_pml4 = ensure_kernel_pml4()?;
     let heap_base = USER_HEAP_BASE + pid as u64 * USER_HEAP_STRIDE;
     let mmap_base = USER_MMAP_BASE + pid as u64 * USER_MMAP_STRIDE;
+    let stack_base = KERNEL_STACK_BASE + pid as u64 * KERNEL_STACK_STRIDE;
     ensure_next_table(kernel_pml4 as *mut u64, pml4_index(heap_base))?;
     ensure_next_table(kernel_pml4 as *mut u64, pml4_index(mmap_base))?;
+    // Pre-touch the stack window's top-level entry too, same as heap/mmap
+    // above, *before* cloning the shared kernel PML4 below -- the clone is
+    // a snapshot of the top-level entries as they exist right now, so
+    // anything `create_process_stack` maps later (deeper page-table levels
+    // only, not new top-level entries) stays visible through this
+    // process's own private PML4 without needing to redo the clone.
+    ensure_next_table(kernel_pml4 as *mut u64, pml4_index(stack_base))?;
     let new_pml4 = alloc_zeroed_page()?;
     unsafe {
         copy_nonoverlapping(
@@ -2810,6 +2847,51 @@ fn destroy_process_address_space(pml4_phys: u64) {
         free_phys_page(pdpt_phys);
     }
     free_phys_page(pml4_phys);
+}
+
+/// Maps this pid's kernel stack -- `KERNEL_STACK_PAGES` pages at the *top*
+/// of its `KERNEL_STACK_STRIDE` address slice, leaving the rest of the
+/// slice unmapped as a guard gap (see the constants' docs) -- into the
+/// shared kernel PML4, and returns the initial stack pointer: the top of
+/// the mapped range (exclusive), 16-byte-aligned since it's page-aligned.
+/// `create_process_address_space` must already have been called for this
+/// pid (it pre-touches this window's top-level entry before cloning).
+fn create_process_stack(pid: u32) -> Option<u64> {
+    let kernel_pml4 = ensure_kernel_pml4()?;
+    let stack_base = KERNEL_STACK_BASE + pid as u64 * KERNEL_STACK_STRIDE;
+    let stack_top = stack_base + KERNEL_STACK_STRIDE;
+    let mapped_base = stack_top - (KERNEL_STACK_PAGES as u64) * PAGE_SIZE;
+    if !map_user_pages(kernel_pml4, mapped_base, KERNEL_STACK_PAGES) {
+        return None;
+    }
+    Some(stack_top)
+}
+
+/// Frees a pid's kernel stack: the mapped data pages, plus the PT that
+/// mapped them -- safe to free the whole PT (not just the data pages)
+/// because `KERNEL_STACK_STRIDE` is exactly one PD entry's span, so this
+/// pid never shares that PT with any other pid's stack.
+fn reclaim_process_stack(pid: u32) {
+    let Some(kernel_pml4) = ensure_kernel_pml4() else {
+        return;
+    };
+    let stack_base = KERNEL_STACK_BASE + pid as u64 * KERNEL_STACK_STRIDE;
+    let stack_top = stack_base + KERNEL_STACK_STRIDE;
+    let mapped_base = stack_top - (KERNEL_STACK_PAGES as u64) * PAGE_SIZE;
+    let _ = unmap_user_pages(kernel_pml4, mapped_base, KERNEL_STACK_PAGES);
+    if let Some(pdpt_phys) = table_entry_address(kernel_pml4 as *mut u64, pml4_index(stack_base)) {
+        let pdpt_idx = pdpt_index(stack_base);
+        if let Some(pd_phys) = table_entry_address(pdpt_phys as *mut u64, pdpt_idx) {
+            let pd_idx = pd_index(stack_base);
+            if let Some(pt_phys) = table_entry_address(pd_phys as *mut u64, pd_idx) {
+                free_phys_page(pt_phys);
+                unsafe {
+                    (pd_phys as *mut u64).add(pd_idx).write_volatile(0);
+                    invlpg(mapped_base);
+                }
+            }
+        }
+    }
 }
 
 fn alloc_zeroed_page() -> Option<u64> {
@@ -3020,6 +3102,259 @@ unsafe fn write_cr3(value: u64) {
     unsafe {
         asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags));
     }
+}
+
+/// The classic minimal fiber-switch: push the outgoing context's
+/// callee-saved registers onto its *own* stack, save the resulting `rsp`
+/// into `*prev`, load `rsp` from `*next`, then pop what's sitting there
+/// (either callee-saved registers a previous switch *into* that context
+/// pushed, or -- for a brand-new process that's never run before -- the
+/// hand-built initial frame `create_process_stack`'s caller writes; see
+/// `spawn_prepared`) and `ret` into whatever return address is on top.
+///
+/// `rdi`/`rsi` hold `prev`/`next` per the SysV calling convention -- this
+/// is a real function call (`switch_to` calls it normally), not an
+/// interrupt, so unlike the ISR stubs above this one *must* return
+/// (`ret`), just not necessarily to its own caller: it returns to whatever
+/// instruction address was sitting at `*next`'s stack top, which is a
+/// *different* suspended call to this exact function (or, for a new
+/// process, `process_trampoline`).
+#[unsafe(naked)]
+unsafe extern "sysv64" fn context_switch(prev: *mut CpuContext, next: *const CpuContext) {
+    core::arch::naked_asm!(
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov [rdi], rsp",
+        "mov rsp, [rsi]",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "ret",
+    )
+}
+
+/// Switches execution to `next_index` (a real `PROCESS_TABLE` slot, or
+/// `PROCESS_COUNT` for the reserved idle/kernel-console slot), saving the
+/// currently-running context first. Does not return to its caller until
+/// something *else* later switches back to whichever index called this --
+/// see `context_switch`'s docs. Handles the CR3 switch too (the idle slot's
+/// `pml4_phys` is always 0, meaning "use the shared kernel PML4").
+fn switch_to(next_index: usize) {
+    unsafe {
+        let table = &raw mut PROCESS_TABLE;
+        if next_index < PROCESS_COUNT {
+            (*table)[next_index].state = ProcessState::Running;
+        }
+        let prev_index = CURRENT_PROCESS_INDEX;
+        CURRENT_PROCESS_INDEX = next_index;
+        let next_pml4 = (*table)[next_index].pml4_phys;
+        let target_pml4 = if next_pml4 != 0 {
+            next_pml4
+        } else {
+            ensure_kernel_pml4().unwrap_or(0)
+        };
+        if target_pml4 != 0 {
+            write_cr3(target_pml4);
+        }
+        let prev_ctx = core::ptr::addr_of_mut!((*table)[prev_index].context);
+        let next_ctx = core::ptr::addr_of!((*table)[next_index].context);
+        context_switch(prev_ctx, next_ctx);
+    }
+    // However this particular call to `switch_to` returned -- resumed
+    // later, on a genuinely different stack than whatever most recently
+    // exited -- it's always safe right here to reclaim any exited
+    // process's stack that couldn't free its own (see `process_trampoline`,
+    // `queue_stack_reclaim`).
+    reclaim_pending_stacks();
+}
+
+/// Pids whose kernel stack `process_trampoline` couldn't free itself
+/// (can't free the stack you're currently executing on) -- see
+/// `queue_stack_reclaim`/`reclaim_pending_stacks`, drained by `switch_to`.
+static mut PENDING_STACK_RECLAIMS: [Option<u32>; PROCESS_COUNT] = [None; PROCESS_COUNT];
+
+/// Queues `pid`'s kernel stack to be freed once we're safely running on a
+/// different one -- see `switch_to`'s post-`context_switch` call to
+/// `reclaim_pending_stacks`. Sized to `PROCESS_COUNT` since at most that
+/// many processes could ever be simultaneously mid-exit-and-not-yet-
+/// reclaimed; silently drops (leaking one 128 KiB stack window, never
+/// corrupting anything) in the should-never-happen case that's exceeded.
+fn queue_stack_reclaim(pid: u32) {
+    unsafe {
+        let slots = &mut *core::ptr::addr_of_mut!(PENDING_STACK_RECLAIMS);
+        for slot in slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(pid);
+                return;
+            }
+        }
+    }
+}
+
+fn reclaim_pending_stacks() {
+    unsafe {
+        let slots = &mut *core::ptr::addr_of_mut!(PENDING_STACK_RECLAIMS);
+        for slot in slots.iter_mut() {
+            if let Some(pid) = slot.take() {
+                reclaim_process_stack(pid);
+            }
+        }
+    }
+}
+
+fn interrupts_enabled() -> bool {
+    let flags: u64;
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
+    }
+    flags & (1 << 9) != 0
+}
+
+/// Runs `f` with interrupts disabled, restoring the *actual* previous `IF`
+/// state afterward rather than unconditionally re-enabling -- safe to nest,
+/// and safe to call from a context that's already interrupt-disabled (e.g.
+/// once category 2's stage 3 timer ISR exists and calls into this same
+/// scheduler core with interrupts already off on entry). No interrupt
+/// exists yet in stage 2 (`sti` is never called anywhere), so this is a
+/// no-op in practice today -- but writing every scheduler critical section
+/// this way from day one means stage 3 is an addition to this code, not a
+/// rewrite of it.
+fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
+    let was_enabled = interrupts_enabled();
+    if was_enabled {
+        unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
+    }
+    let result = f();
+    if was_enabled {
+        unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) };
+    }
+    result
+}
+
+/// The next `Ready` process to run, scanning `PROCESS_TABLE` in index order
+/// (a plain scan is plenty given `PROCESS_COUNT` = 16 and no priority
+/// concept yet). Never returns the reserved idle slot -- that's the
+/// fallback when nothing else is runnable, not something to "pick".
+fn pick_next_ready() -> Option<usize> {
+    without_interrupts(|| unsafe {
+        let table = &raw const PROCESS_TABLE;
+        for index in 0..PROCESS_COUNT {
+            if (*table)[index].state == ProcessState::Ready {
+                return Some(index);
+            }
+        }
+        None
+    })
+}
+
+/// Moves every process `Blocked` on `pid` (or blocked on "any child," via
+/// `WaitTarget::AnyChild`) back to `Ready` so `pick_next_ready` can find it
+/// again. Called whenever a process exits (`exit_and_yield`) -- see
+/// `abi_wait`/`abi_wait_any` for the other half (the actual condition
+/// re-check, once resumed).
+fn wake_waiters_for(pid: u32) {
+    without_interrupts(|| unsafe {
+        let table = &raw mut PROCESS_TABLE;
+        for index in 0..PROCESS_COUNT {
+            let process = &mut (*table)[index];
+            if process.state != ProcessState::Blocked {
+                continue;
+            }
+            let should_wake = match process.waiting_for {
+                WaitTarget::Pid(target) => target == pid,
+                WaitTarget::AnyChild => true,
+                WaitTarget::None => false,
+            };
+            if should_wake {
+                process.waiting_for = WaitTarget::None;
+                process.state = ProcessState::Ready;
+            }
+        }
+    });
+}
+
+/// Marks the current process's exit, wakes anything waiting on its pid,
+/// then hands the CPU to whatever should run next. Called from
+/// `process_trampoline` once a process's entry point returns. Nothing will
+/// ever `pick_next_ready` an `Exited` process, so this never meaningfully
+/// resumes its own now-dead context again -- but it's written as a genuine
+/// loop (not relying on that cleverness) to satisfy `-> !` honestly.
+fn exit_and_yield(exit_index: usize, code: i32) -> ! {
+    let pid = process_pid(exit_index);
+    process_set_state(exit_index, ProcessState::Exited, code);
+    wake_waiters_for(pid);
+    loop {
+        let next = pick_next_ready().unwrap_or(PROCESS_COUNT);
+        switch_to(next);
+    }
+}
+
+/// Entry point for a brand-new process's very first time being switched
+/// into -- `spawn_prepared` hand-builds the initial `CpuContext` to point
+/// here (see its docs). Runs the process's real ELF entry point on the
+/// process's own kernel stack; CR3 is already switched to its private PML4
+/// by `switch_to` before this ever starts running, so no address-space
+/// work is needed here on the way in. Once the entry point returns, tears
+/// down everything `spawn_prepared` built for it and hands off to the
+/// scheduler -- never returns to a "caller" in the traditional sense (see
+/// `exit_and_yield`). Unlike the old synchronous `run_ready_task`, this
+/// does *not* drain any children the process spawned but never waited on:
+/// under real (even just cooperative) scheduling, an orphaned child simply
+/// keeps existing in the process table and gets scheduled normally by
+/// whatever later calls `pick_next_ready`, regardless of whether its
+/// original parent already exited -- there is no nested call stack relying
+/// on it finishing first anymore.
+extern "sysv64" fn process_trampoline() -> ! {
+    let index = unsafe { CURRENT_PROCESS_INDEX };
+    let (entry, pid, pml4_phys) = unsafe {
+        let table = &raw const PROCESS_TABLE;
+        let process = &(*table)[index];
+        (process.entry_point, process.pid, process.pml4_phys)
+    };
+
+    let code = unsafe {
+        let program: extern "sysv64" fn(*const RymosAbi) -> i32 = core::mem::transmute(entry);
+        program(&RYMOS_ABI)
+    };
+
+    let reclaimed = process_reclaim_mappings(index);
+    reclaim_process_window_tables(pid);
+    destroy_process_address_space(pml4_phys);
+    // `destroy_process_address_space` just freed the physical page CR3 is
+    // still pointing at -- switch back to the shared kernel PML4
+    // immediately so nothing runs even briefly with a dangling CR3 (the
+    // freed page could be reallocated for something else at any point
+    // after this).
+    if let Some(kernel_pml4) = ensure_kernel_pml4() {
+        unsafe {
+            write_cr3(kernel_pml4);
+        }
+    }
+    unsafe {
+        let table = &raw mut PROCESS_TABLE;
+        (*table)[index].pml4_phys = 0;
+    }
+    // Can't free *this* process's own stack while still standing on it --
+    // queue it, and whichever switch_to next actually returns somewhere
+    // (running on a different stack by definition) reclaims it then. See
+    // `queue_stack_reclaim`/`reclaim_pending_stacks`.
+    queue_stack_reclaim(pid);
+    if reclaimed > 0 {
+        if let Some(console) = unsafe { APP_CONSOLE.as_mut() } {
+            console.write("heap reclaimed ");
+            console.write_usize(reclaimed);
+            console.write_line(" pages");
+        }
+    }
+
+    exit_and_yield(index, code)
 }
 
 unsafe fn invlpg(virt: u64) {
@@ -3323,36 +3658,17 @@ fn pfs_list_match<'a>(namespace: &[u8], name: &'a [u8]) -> Option<&'a [u8]> {
     Some(child)
 }
 
-fn app_reset_path_state() {
-    unsafe {
-        let cwd = core::ptr::addr_of_mut!(APP_CWD);
-        (*cwd).fill(0);
-        (*cwd)[0] = b'/';
-        APP_CWD_LEN = 1;
-        APP_LAST_ERROR = ERR_OK;
-    }
-}
-
 fn set_app_error(error: i32) -> i32 {
     unsafe {
-        APP_LAST_ERROR = error;
+        PROCESS_TABLE[CURRENT_PROCESS_INDEX].last_error = error;
     }
     -1
-}
-
-fn reset_app_std_fds() {
-    unsafe {
-        let std_fds = core::ptr::addr_of_mut!(APP_STD_FDS);
-        (*std_fds)[0] = STDIN_FD;
-        (*std_fds)[1] = STDOUT_FD;
-        (*std_fds)[2] = STDERR_FD;
-    }
 }
 
 fn app_resolve_fd(fd: i32) -> i32 {
     if (STDIN_FD..=STDERR_FD).contains(&fd) {
         unsafe {
-            let std_fds = core::ptr::addr_of!(APP_STD_FDS);
+            let std_fds = core::ptr::addr_of!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].std_fds);
             return (*std_fds)[fd as usize];
         }
     }
@@ -3374,24 +3690,24 @@ fn app_fd_open(fd: i32) -> bool {
 
 fn clear_app_error() {
     unsafe {
-        APP_LAST_ERROR = ERR_OK;
+        PROCESS_TABLE[CURRENT_PROCESS_INDEX].last_error = ERR_OK;
     }
 }
 
 fn app_cwd_is_pfs() -> bool {
     unsafe {
-        let cwd = core::ptr::addr_of!(APP_CWD);
-        APP_CWD_LEN >= 4 && &(&(*cwd))[..4] == b"pfs:"
+        let cwd = core::ptr::addr_of!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd);
+        PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd_len >= 4 && &(&(*cwd))[..4] == b"pfs:"
     }
 }
 
 fn app_cwd_pfs_name<'a>(buffer: &'a mut [u8; PFS_NAME_MAX]) -> &'a [u8] {
     unsafe {
-        let cwd = core::ptr::addr_of!(APP_CWD);
-        if APP_CWD_LEN <= 4 {
+        let cwd = core::ptr::addr_of!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd);
+        if PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd_len <= 4 {
             return &buffer[..0];
         }
-        let len = min(APP_CWD_LEN - 4, PFS_NAME_MAX);
+        let len = min(PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd_len - 4, PFS_NAME_MAX);
         buffer[..len].copy_from_slice(&(&(*cwd))[4..4 + len]);
         &buffer[..len]
     }
@@ -3988,24 +4304,29 @@ extern "sysv64" fn abi_write(ptr: *const u8, len: usize) {
 }
 
 extern "sysv64" fn abi_pid() -> u32 {
-    unsafe { APP_PID }
+    current_pid()
 }
 
 extern "sysv64" fn abi_args(ptr: *mut u8, len: usize) -> usize {
+    let (args_ptr, args_len) = unsafe {
+        let table = &raw const PROCESS_TABLE;
+        let process = &(*table)[CURRENT_PROCESS_INDEX];
+        (process.args.as_ptr(), process.args_len)
+    };
     if ptr.is_null() || len == 0 {
-        return unsafe { APP_ARGS_LEN };
+        return args_len;
     }
 
     unsafe {
-        let copy_len = min(len, APP_ARGS_LEN);
-        copy_nonoverlapping(APP_ARGS_PTR, ptr, copy_len);
+        let copy_len = min(len, args_len);
+        copy_nonoverlapping(args_ptr, ptr, copy_len);
         copy_len
     }
 }
 
 extern "sysv64" fn abi_argv_count() -> usize {
     unsafe {
-        let process_index = APP_PROCESS_INDEX;
+        let process_index = CURRENT_PROCESS_INDEX;
         if process_index >= PROCESS_COUNT {
             0
         } else {
@@ -4031,7 +4352,7 @@ fn copy_argv_value(
     len: usize,
 ) -> Option<usize> {
     let value = if index == 0 {
-        let process_index = unsafe { APP_PROCESS_INDEX };
+        let process_index = unsafe { CURRENT_PROCESS_INDEX };
         if process_index >= PROCESS_COUNT {
             return None;
         }
@@ -4042,7 +4363,7 @@ fn copy_argv_value(
             &process_name[..process.name_len]
         }
     } else {
-        let process_index = unsafe { APP_PROCESS_INDEX };
+        let process_index = unsafe { CURRENT_PROCESS_INDEX };
         if process_index >= PROCESS_COUNT {
             return None;
         }
@@ -4457,7 +4778,7 @@ extern "sysv64" fn abi_close(fd: i32) -> i32 {
     }
     if fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD {
         unsafe {
-            let std_fds = core::ptr::addr_of_mut!(APP_STD_FDS);
+            let std_fds = core::ptr::addr_of_mut!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].std_fds);
             (*std_fds)[fd as usize] = fd;
         }
         return 0;
@@ -4720,7 +5041,7 @@ extern "sysv64" fn abi_env_remove(key_ptr: *const u8, key_len: usize) -> i32 {
 
 fn env_lookup<'a>(key: &[u8]) -> Option<&'a [u8]> {
     unsafe {
-        let app_env = core::ptr::addr_of!(APP_ENV);
+        let app_env = core::ptr::addr_of!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].env);
         for entry in &*app_env {
             if entry.used && &entry.key[..entry.key_len] == key {
                 if entry.deleted {
@@ -4741,7 +5062,7 @@ fn env_lookup<'a>(key: &[u8]) -> Option<&'a [u8]> {
 fn env_list_entry<'a>(wanted: usize) -> Option<(&'a [u8], &'a [u8])> {
     let mut seen = 0usize;
     unsafe {
-        let app_env = core::ptr::addr_of!(APP_ENV);
+        let app_env = core::ptr::addr_of!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].env);
         for entry in &*app_env {
             if entry.used && !entry.deleted {
                 if seen == wanted {
@@ -4765,7 +5086,7 @@ fn env_list_entry<'a>(wanted: usize) -> Option<(&'a [u8], &'a [u8])> {
 
 fn env_overlay_has_key(key: &[u8]) -> bool {
     unsafe {
-        let app_env = core::ptr::addr_of!(APP_ENV);
+        let app_env = core::ptr::addr_of!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].env);
         for entry in &*app_env {
             if entry.used && &entry.key[..entry.key_len] == key {
                 return true;
@@ -4785,7 +5106,7 @@ fn env_set_overlay(key: &[u8], value: &[u8], deleted: bool) -> i32 {
     }
 
     unsafe {
-        let app_env = core::ptr::addr_of_mut!(APP_ENV);
+        let app_env = core::ptr::addr_of_mut!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].env);
         let mut slot = APP_ENV_COUNT;
         for index in 0..APP_ENV_COUNT {
             if (*app_env)[index].used
@@ -4891,47 +5212,118 @@ extern "sysv64" fn abi_spawn_argv(
     spawn_prepared(name, &raw_args[..raw_len], Some(&argv[..argv_len]))
 }
 
-/// Registers a child in the process table and runs it to completion via
-/// `run_ready_task` before returning its pid.
+/// Hand-builds a brand-new process's initial stack frame so that
+/// `context_switch`'s `pop`+`ret` sequence lands at `entry_point` -- see
+/// `context_switch`'s docs for the exact register layout expected. The `-
+/// 64` (not `-56`, the literal size of 6 zeroed registers plus one return
+/// address) keeps SysV's 16-byte alignment intact from a page-aligned
+/// (hence already 16-aligned) `stack_top`: 64 is itself a multiple of 16,
+/// so the arithmetic can't drift it, unlike 56 -- verified against the
+/// context-switch smoke test earlier in this file. Returns the initial
+/// `rsp` to store in the new process's `CpuContext`.
+fn build_initial_stack_frame(stack_top: u64, entry_point: u64) -> u64 {
+    let initial_rsp = stack_top - 64;
+    unsafe {
+        let slot = initial_rsp as *mut u64;
+        for i in 0..6u64 {
+            slot.add(i as usize).write(0);
+        }
+        slot.add(6).write(entry_point);
+    }
+    initial_rsp
+}
+
+/// Builds everything a freshly `process_spawn`-registered process needs to
+/// actually run later -- an isolated address space, its ELF loaded into it,
+/// its own kernel stack, and an initial `CpuContext` pointing at
+/// `process_trampoline` -- and marks it `Ready`. Nothing runs yet: the
+/// scheduler (`pick_next_ready`, driven from `abi_wait`/`abi_wait_any`/
+/// `run_program`) decides when this process actually gets switched into,
+/// which is the real behavior change from the old synchronous model (see
+/// `spawn_prepared`'s docs for why that model couldn't just be extended
+/// bit by bit). On failure, marks the process `Failed` and returns `false`.
+fn prepare_process(index: usize, console: &mut Console, image: &[u8]) -> bool {
+    let pid = process_pid(index);
+    let Some(parent_pml4) = current_pml4_or_kernel() else {
+        process_set_state(index, ProcessState::Failed, -1);
+        return false;
+    };
+    let Some(child_pml4) = create_process_address_space(pid) else {
+        process_set_state(index, ProcessState::Failed, -1);
+        return false;
+    };
+
+    // Loading the ELF writes segment data through the child's own virtual
+    // image-window addresses, so CR3 has to point at its private PML4 for
+    // the duration of the load -- restored immediately after, since this
+    // process isn't actually running yet (see `switch_to`, which is what
+    // sets CR3 for real once the scheduler picks this process).
+    unsafe {
+        write_cr3(child_pml4);
+    }
+    let entry = load_program_elf_isolated(console, image, child_pml4);
+    unsafe {
+        write_cr3(parent_pml4);
+    }
+    let Some(entry) = entry else {
+        destroy_process_address_space(child_pml4);
+        process_set_state(index, ProcessState::Failed, -1);
+        return false;
+    };
+
+    let Some(stack_top) = create_process_stack(pid) else {
+        destroy_process_address_space(child_pml4);
+        process_set_state(index, ProcessState::Failed, -1);
+        return false;
+    };
+    let initial_rsp =
+        build_initial_stack_frame(stack_top, process_trampoline as *const () as u64);
+
+    app_set_heap_window(index, pid);
+    unsafe {
+        let table = &raw mut PROCESS_TABLE;
+        let process = &mut (*table)[index];
+        process.pml4_phys = child_pml4;
+        process.entry_point = entry;
+        process.context.rsp = initial_rsp;
+    }
+    process_set_state(index, ProcessState::Ready, 0);
+    true
+}
+
+/// Registers a child in the process table, prepares it to run (address
+/// space, ELF, stack, initial context), and returns its pid immediately --
+/// spawn no longer runs the child itself; see `prepare_process`'s docs.
 ///
-/// A genuinely deferred version of this (enqueue and return immediately,
-/// letting `wait`/`wait_any` run pending children later) was tried and
-/// reverted: it silently broke every existing `spawn`-then-read-a-pipe
-/// caller that has no intervening `wait()` at all -- several of rysh's own
-/// shell built-ins (`spawnredir`, `spawnstdin`, `spawnio`, `spawnioe`) read a
-/// redirected pipe's output immediately after `spawn()` purely because
-/// `spawn()` used to block until the child finished; deferring it left the
-/// pipe empty (or, worse, closed before the child ever ran). Fixing every
-/// affected caller across rysh and the `Command` helpers in `rymos-user`
-/// would be its own large, separate audit, not a bounded piece of category
-/// 2 -- caught live via a genuine QEMU hang (100% CPU, `echoin` spinning on
-/// stdin that was never actually connected), not just reasoned about.
-/// `run_ready_task` and the `Ready`-child lookups it enabled are kept (see
-/// `find_ready_child_of`, and the exit-time drain in `run_ready_task`/
-/// `run_program`) as a harmless defense-in-depth safety net, but nothing
-/// relies on them actually finding anything under this eager model.
-///
-/// Real concurrent (interleaved) execution still needs the ABI state to move
-/// into a real per-process control block (today it's flat globals like
-/// `APP_FDS`/`APP_CWD`/`APP_ENV`) plus either a scheduler with saved
-/// per-process CPU context or full preemption -- unchanged from before this
-/// attempt, and flagged in the roadmap as the next, separate lift.
+/// A genuinely deferred version of this was tried once before, much
+/// earlier, and reverted: it silently broke every existing
+/// `spawn`-then-read-a-pipe caller that had no intervening `wait()` at all
+/// -- several of rysh's own shell built-ins (`spawnredir`, `spawnstdin`,
+/// `spawnio`, `spawnioe`) read a redirected pipe's output immediately after
+/// `spawn()` purely because `spawn()` used to block until the child
+/// finished; deferring it left the pipe empty (or, worse, closed before
+/// the child ever ran). That attempt was reverted rather than fixing every
+/// affected caller as its own large audit. This time the fix *is* done:
+/// those rysh built-ins and `rymos-user`'s `Command` helpers now actually
+/// `wait()` before reverting stdio redirection (see their own docs), and
+/// `abi_wait`/`abi_wait_any` are real blocking calls now (see their docs)
+/// that drive the scheduler until the right child has actually run.
 fn spawn_prepared(name: &[u8], args: &[u8], argv: Option<&[ArgSlice]>) -> i32 {
     let bootfs = unsafe { APP_BOOTFS };
 
-    let parent_process_index = unsafe { APP_PROCESS_INDEX };
+    let parent_process_index = unsafe { CURRENT_PROCESS_INDEX };
     if parent_process_index >= PROCESS_COUNT {
         return set_app_error(ERR_INVAL);
     }
 
     let mut child_path = [0u8; 32];
     let child_path_len = program_path(name, &mut child_path);
-    if bootfs.find_data(&child_path[..child_path_len]).is_none() {
+    let Some(child_image) = bootfs.find_data(&child_path[..child_path_len]) else {
         return set_app_error(ERR_NOENT);
-    }
+    };
 
     let child_process_index = if let Some(argv) = argv {
-        process_spawn_with_argv(name, args, argv, unsafe { APP_PID })
+        process_spawn_with_argv(name, args, argv, current_pid())
     } else {
         process_spawn(name, args)
     };
@@ -4939,162 +5331,135 @@ fn spawn_prepared(name: &[u8], args: &[u8], argv: Option<&[ArgSlice]>) -> i32 {
         return set_app_error(ERR_NOSPC);
     };
 
-    // Capture the caller's std-fd/cwd/env redirection state right now, not
-    // when the child actually runs -- see the `Process::inherited_*` field
-    // docs for why this has to happen here.
+    // Copy the caller's *current* std-fd/cwd/env redirection state into the
+    // child's own fields right now, not when the child actually runs -- see
+    // `Process`'s docs for why this has to happen here rather than reading
+    // the parent's live state later (a `Command`-style helper redirects,
+    // spawns, then reverts the redirection before ever waiting).
     unsafe {
         let table = &raw mut PROCESS_TABLE;
+        let parent_std_fds = (*table)[parent_process_index].std_fds;
+        let parent_cwd = (*table)[parent_process_index].cwd;
+        let parent_cwd_len = (*table)[parent_process_index].cwd_len;
+        let parent_env = (*table)[parent_process_index].env;
         let process = &mut (*table)[child_process_index];
-        process.inherited_std_fds = *core::ptr::addr_of!(APP_STD_FDS);
-        process.inherited_cwd = *core::ptr::addr_of!(APP_CWD);
-        process.inherited_cwd_len = APP_CWD_LEN;
-        process.inherited_env = *core::ptr::addr_of!(APP_ENV);
+        process.std_fds = parent_std_fds;
+        process.cwd = parent_cwd;
+        process.cwd_len = parent_cwd_len;
+        process.env = parent_env;
     }
 
-    run_ready_task(child_process_index);
+    let Some(console) = (unsafe { APP_CONSOLE.as_mut() }) else {
+        process_set_state(child_process_index, ProcessState::Failed, -1);
+        return set_app_error(ERR_INVAL);
+    };
+    if !prepare_process(child_process_index, console, child_image) {
+        return set_app_error(ERR_IO);
+    }
+
     clear_app_error();
     process_pid(child_process_index) as i32
 }
 
-/// Actually runs a previously-enqueued (`Ready`) child to completion: builds
-/// its isolated address space, loads its ELF image, runs it, then drains any
-/// children *it* spawned but never waited on before finalizing its own exit
-/// (recursively -- a grandchild left pending gets the same treatment). See
-/// `spawn_prepared` for why this is deferred instead of running inline.
-fn run_ready_task(child_index: usize) -> i32 {
-    let Some(console) = (unsafe { APP_CONSOLE.as_mut() }) else {
-        process_set_state(child_index, ProcessState::Failed, -1);
-        return -1;
-    };
-    let bootfs = unsafe { APP_BOOTFS };
+/// Marks the currently-running process (a no-op if we're actually the
+/// reserved idle/console context, which has no `state` that matters)
+/// `Blocked` on `target`, so `pick_next_ready` skips it until
+/// `wake_waiters_for` moves it back to `Ready`.
+fn block_current_on(target: WaitTarget) {
+    unsafe {
+        let index = CURRENT_PROCESS_INDEX;
+        if index < PROCESS_COUNT {
+            let table = &raw mut PROCESS_TABLE;
+            let process = &mut (*table)[index];
+            process.waiting_for = target;
+            process.state = ProcessState::Blocked;
+        }
+    }
+}
 
-    let (child_pid, name_len, child_name) = unsafe {
+/// Gives the CPU to whatever should run next -- a `Ready` process if one
+/// exists, else falls back to the reserved idle/console slot. The one
+/// building block `wait`/`wait_any`'s blocking loops share between
+/// "recheck my condition" attempts.
+fn run_scheduler_step() {
+    let next = pick_next_ready().unwrap_or(PROCESS_COUNT);
+    switch_to(next);
+}
+
+/// Is there anything still alive (not yet `Exited`/`Failed`) that's a
+/// child of `parent_pid`? Used to decide whether continuing to block in
+/// `wait_any` could ever pay off, or whether there's nothing left that
+/// will ever satisfy it.
+fn has_live_child(parent_pid: u32) -> bool {
+    unsafe {
         let table = &raw const PROCESS_TABLE;
-        let process = &(*table)[child_index];
-        (process.pid, process.name_len, process.name)
-    };
-
-    let mut child_path = [0u8; 32];
-    let child_path_len = program_path(&child_name[..name_len], &mut child_path);
-    let Some(child_image) = bootfs.find_data(&child_path[..child_path_len]) else {
-        process_set_state(child_index, ProcessState::Failed, -1);
-        return -1;
-    };
-
-    let snapshot = app_snapshot();
-
-    // Parent and child each get their own address space for the program
-    // image window, so the child overwriting it can't disturb the parent's
-    // code or data (previously this had to snapshot the parent's ELF and
-    // reload its read-only segments afterward -- and could never restore its
-    // writable data at all, since it was never saved).
-    let Some(parent_pml4) = current_pml4_or_kernel() else {
-        app_restore(snapshot);
-        process_set_state(child_index, ProcessState::Failed, -1);
-        return -1;
-    };
-    let Some(child_pml4) = create_process_address_space(child_pid) else {
-        app_restore(snapshot);
-        process_set_state(child_index, ProcessState::Failed, -1);
-        return -1;
-    };
-
-    unsafe {
-        write_cr3(child_pml4);
+        for index in 0..PROCESS_COUNT {
+            let process = &(*table)[index];
+            if process.parent_pid == parent_pid
+                && matches!(
+                    process.state,
+                    ProcessState::Ready | ProcessState::Running | ProcessState::Blocked
+                )
+            {
+                return true;
+            }
+        }
     }
+    false
+}
 
-    let Some(entry) = load_program_elf_isolated(console, child_image, child_pml4) else {
-        unsafe {
-            write_cr3(parent_pml4);
+/// Blocks (via the scheduler -- see `block_current_on`/`run_scheduler_step`)
+/// until `pid` has exited, then returns its status. This is the real
+/// blocking wait category 2's scheduler work was for: if `pid` is still
+/// `Ready` (spawned but never actually run yet, under the new deferred
+/// `spawn_prepared`), the very first iteration's `run_scheduler_step` is
+/// what actually runs it for the first time. Shared core for both
+/// `abi_wait` and `run_program` (the top-level console `run` command,
+/// which isn't going through the ABI's pointer-writing convention but
+/// still needs to block the same way).
+fn wait_for_pid_blocking(pid: u32) -> Option<RymosProcessStatus> {
+    loop {
+        if let Some(status) = process_wait_by_pid(pid) {
+            return Some(status);
         }
-        destroy_process_address_space(child_pml4);
-        app_restore(snapshot);
-        process_set_state(child_index, ProcessState::Failed, -1);
-        return -1;
-    };
-
-    let code = unsafe {
-        process_set_state(child_index, ProcessState::Running, 0);
-        APP_CONSOLE = console as *mut Console;
-        APP_BOOTFS = bootfs;
-        {
-            let table = &raw const PROCESS_TABLE;
-            APP_ARGS_PTR = (*table)[child_index].args.as_ptr();
-            APP_ARGS_LEN = (*table)[child_index].args_len;
+        if find_process_index_by_pid(pid).is_none() {
+            // No such pid at all (never existed, or already reaped) --
+            // nothing will ever satisfy this wait.
+            return None;
         }
-        APP_PID = child_pid;
-        APP_PROCESS_INDEX = child_index;
-        app_set_heap_window(child_pid);
-        {
-            let table = &raw mut PROCESS_TABLE;
-            let process = &mut (*table)[child_index];
-            process.pml4_phys = child_pml4;
-            APP_STD_FDS = process.inherited_std_fds;
-            APP_CWD = process.inherited_cwd;
-            APP_CWD_LEN = process.inherited_cwd_len;
-            APP_ENV = process.inherited_env;
-        }
-
-        let program: extern "sysv64" fn(*const RymosAbi) -> i32 = core::mem::transmute(entry);
-        let code = program(&RYMOS_ABI);
-
-        // Defense in depth (see `spawn_prepared`'s docs): nothing should ever
-        // actually be `Ready` here under today's eager spawn, but if a
-        // grandchild is ever left pending, drain it before this process's
-        // own exit finalizes.
-        while let Some(grandchild) = find_ready_child_of(child_pid) {
-            run_ready_task(grandchild);
-        }
-
-        let reclaimed = process_reclaim_mappings(child_index);
-        reclaim_process_window_tables(child_pid);
-        destroy_process_address_space(child_pml4);
-        {
-            let table = &raw mut PROCESS_TABLE;
-            (*table)[child_index].pml4_phys = 0;
-        }
-        app_clear_heap_window();
-        process_set_state(child_index, ProcessState::Exited, code);
-        if reclaimed > 0 {
-            console.write("heap reclaimed ");
-            console.write_usize(reclaimed);
-            console.write_line(" pages");
-        }
-        code
-    };
-
-    unsafe {
-        write_cr3(parent_pml4);
+        block_current_on(WaitTarget::Pid(pid));
+        run_scheduler_step();
     }
-    app_restore_after_spawn(snapshot);
-    clear_app_error();
-    code
+}
+
+/// Same as `wait_for_pid_blocking`, but for any unwaited child of
+/// `parent_pid` rather than one specific pid -- the shared core for
+/// `abi_wait_any`.
+fn wait_for_any_child_blocking(parent_pid: u32) -> Option<(u32, RymosProcessStatus)> {
+    loop {
+        if let Some(result) = process_wait_any_child(parent_pid) {
+            return Some(result);
+        }
+        if !has_live_child(parent_pid) {
+            return None;
+        }
+        block_current_on(WaitTarget::AnyChild);
+        run_scheduler_step();
+    }
 }
 
 extern "sysv64" fn abi_wait(pid: u32, status_ptr: *mut RymosProcessStatus) -> i32 {
     if status_ptr.is_null() {
         return -1;
     }
-    loop {
-        if let Some(status) = process_wait_by_pid(pid) {
+    match wait_for_pid_blocking(pid) {
+        Some(status) => {
             unsafe {
                 status_ptr.write(status);
             }
-            return 0;
+            0
         }
-        let Some(index) = find_process_index_by_pid(pid) else {
-            return -1;
-        };
-        let is_ready = unsafe {
-            let table = &raw const PROCESS_TABLE;
-            matches!((*table)[index].state, ProcessState::Ready)
-        };
-        if !is_ready {
-            // Already waited on, doesn't exist, or (shouldn't happen: only
-            // one task ever executes at a time) somehow mid-run.
-            return -1;
-        }
-        run_ready_task(index);
+        None => -1,
     }
 }
 
@@ -5102,18 +5467,15 @@ extern "sysv64" fn abi_wait_any(status_ptr: *mut RymosProcessStatus) -> i32 {
     if status_ptr.is_null() {
         return -1;
     }
-    let parent_pid = unsafe { APP_PID };
-    loop {
-        if let Some((pid, status)) = process_wait_any_child(parent_pid) {
+    let parent_pid = current_pid();
+    match wait_for_any_child_blocking(parent_pid) {
+        Some((pid, status)) => {
             unsafe {
                 status_ptr.write(status);
             }
-            return pid as i32;
+            pid as i32
         }
-        let Some(index) = find_ready_child_of(parent_pid) else {
-            return -1;
-        };
-        run_ready_task(index);
+        None => -1,
     }
 }
 
@@ -5124,23 +5486,25 @@ extern "sysv64" fn abi_mem_alloc_pages(page_count: usize) -> u64 {
     let Some(pml4_phys) = ensure_kernel_pml4() else {
         return 0;
     };
-    let process_index = unsafe { APP_PROCESS_INDEX };
+    let process_index = unsafe { CURRENT_PROCESS_INDEX };
 
     let base = unsafe {
-        if APP_HEAP_BASE == 0 || APP_HEAP_NEXT == 0 || APP_HEAP_LIMIT == 0 {
+        let table = &raw mut PROCESS_TABLE;
+        let process = &mut (*table)[process_index];
+        if process.heap_base == 0 || process.heap_next == 0 || process.heap_limit == 0 {
             return 0;
         }
-        let base = APP_HEAP_NEXT;
+        let base = process.heap_next;
         let Some(bytes) = (page_count as u64).checked_mul(PAGE_SIZE) else {
             return 0;
         };
-        let Some(next) = APP_HEAP_NEXT.checked_add(bytes) else {
+        let Some(next) = process.heap_next.checked_add(bytes) else {
             return 0;
         };
-        if next > APP_HEAP_LIMIT {
+        if next > process.heap_limit {
             return 0;
         }
-        APP_HEAP_NEXT = next;
+        process.heap_next = next;
         base
     };
 
@@ -5164,27 +5528,29 @@ extern "sysv64" fn abi_mem_map_pages(page_count: usize, flags: u32) -> u64 {
     let Some(pml4_phys) = ensure_kernel_pml4() else {
         return 0;
     };
-    let process_index = unsafe { APP_PROCESS_INDEX };
+    let process_index = unsafe { CURRENT_PROCESS_INDEX };
     let guard_pages = if flags & MEM_MAP_GUARD != 0 { 2 } else { 0 };
     let Some(total_pages) = page_count.checked_add(guard_pages) else {
         return 0;
     };
 
     let mapped_base = unsafe {
-        if APP_MMAP_NEXT == 0 || APP_MMAP_LIMIT == 0 {
+        let table = &raw mut PROCESS_TABLE;
+        let process = &mut (*table)[process_index];
+        if process.mmap_next == 0 || process.mmap_limit == 0 {
             return 0;
         }
         let Some(bytes) = (total_pages as u64).checked_mul(PAGE_SIZE) else {
             return 0;
         };
-        let reservation_base = APP_MMAP_NEXT;
-        let Some(next) = APP_MMAP_NEXT.checked_add(bytes) else {
+        let reservation_base = process.mmap_next;
+        let Some(next) = process.mmap_next.checked_add(bytes) else {
             return 0;
         };
-        if next > APP_MMAP_LIMIT {
+        if next > process.mmap_limit {
             return 0;
         }
-        APP_MMAP_NEXT = next;
+        process.mmap_next = next;
         if flags & MEM_MAP_GUARD != 0 {
             reservation_base + PAGE_SIZE
         } else {
@@ -5210,7 +5576,7 @@ extern "sysv64" fn abi_mem_unmap_pages(address: u64, page_count: usize) -> i32 {
     {
         return -1;
     }
-    let process_index = unsafe { APP_PROCESS_INDEX };
+    let process_index = unsafe { CURRENT_PROCESS_INDEX };
     if !process_untrack_mapping(process_index, address, page_count) {
         return -1;
     }
@@ -5327,13 +5693,13 @@ extern "sysv64" fn abi_rename(
 }
 
 extern "sysv64" fn abi_cwd(buffer_ptr: *mut u8, buffer_len: usize) -> isize {
-    let len = unsafe { APP_CWD_LEN };
+    let len = unsafe { PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd_len };
     if buffer_ptr.is_null() || buffer_len == 0 {
         return len as isize;
     }
     let copy_len = min(buffer_len, len);
     unsafe {
-        let cwd = core::ptr::addr_of!(APP_CWD);
+        let cwd = core::ptr::addr_of!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd);
         copy_nonoverlapping((*cwd).as_ptr(), buffer_ptr, copy_len);
     }
     clear_app_error();
@@ -5346,20 +5712,20 @@ extern "sysv64" fn abi_chdir(path_ptr: *const u8, path_len: usize) -> i32 {
     };
     if eq(path, b"/") {
         unsafe {
-            let cwd = core::ptr::addr_of_mut!(APP_CWD);
+            let cwd = core::ptr::addr_of_mut!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd);
             (*cwd).fill(0);
             (*cwd)[0] = b'/';
-            APP_CWD_LEN = 1;
+            PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd_len = 1;
         }
         clear_app_error();
         return 0;
     }
     if eq(path, b"pfs:") || eq(path, b"pfs:/") {
         unsafe {
-            let cwd = core::ptr::addr_of_mut!(APP_CWD);
+            let cwd = core::ptr::addr_of_mut!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd);
             (*cwd).fill(0);
             (&mut (*cwd))[..4].copy_from_slice(b"pfs:");
-            APP_CWD_LEN = 4;
+            PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd_len = 4;
         }
         clear_app_error();
         return 0;
@@ -5380,18 +5746,18 @@ extern "sysv64" fn abi_chdir(path_ptr: *const u8, path_len: usize) -> i32 {
         return set_app_error(ERR_NOTDIR);
     }
     unsafe {
-        let cwd = core::ptr::addr_of_mut!(APP_CWD);
+        let cwd = core::ptr::addr_of_mut!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd);
         (*cwd).fill(0);
         (&mut (*cwd))[..4].copy_from_slice(b"pfs:");
         (&mut (*cwd))[4..4 + name_len].copy_from_slice(name);
-        APP_CWD_LEN = 4 + name_len;
+        PROCESS_TABLE[CURRENT_PROCESS_INDEX].cwd_len = 4 + name_len;
     }
     clear_app_error();
     0
 }
 
 extern "sysv64" fn abi_last_error() -> i32 {
-    unsafe { APP_LAST_ERROR }
+    unsafe { PROCESS_TABLE[CURRENT_PROCESS_INDEX].last_error }
 }
 
 extern "sysv64" fn abi_pipe(read_fd_ptr: *mut i32, write_fd_ptr: *mut i32) -> i32 {
@@ -5462,7 +5828,7 @@ extern "sysv64" fn abi_dup2(old_fd: i32, new_fd: i32) -> i32 {
     }
     if old_fd == new_fd {
         unsafe {
-            let std_fds = core::ptr::addr_of_mut!(APP_STD_FDS);
+            let std_fds = core::ptr::addr_of_mut!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].std_fds);
             (*std_fds)[new_fd as usize] = new_fd;
         }
         clear_app_error();
@@ -5472,7 +5838,7 @@ extern "sysv64" fn abi_dup2(old_fd: i32, new_fd: i32) -> i32 {
         return set_app_error(ERR_INVAL);
     }
     unsafe {
-        let std_fds = core::ptr::addr_of_mut!(APP_STD_FDS);
+        let std_fds = core::ptr::addr_of_mut!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].std_fds);
         (*std_fds)[new_fd as usize] = old_fd;
     }
     clear_app_error();
@@ -5496,7 +5862,7 @@ extern "sysv64" fn abi_std_fd(which: i32) -> i32 {
         return -1;
     }
     unsafe {
-        let std_fds = core::ptr::addr_of!(APP_STD_FDS);
+        let std_fds = core::ptr::addr_of!(PROCESS_TABLE[CURRENT_PROCESS_INDEX].std_fds);
         (*std_fds)[which as usize]
     }
 }
@@ -5577,105 +5943,31 @@ fn app_close_all_fds() {
     }
 }
 
-fn app_snapshot() -> AppStateSnapshot {
-    unsafe {
-        AppStateSnapshot {
-            console: APP_CONSOLE,
-            bootfs: APP_BOOTFS,
-            args_ptr: APP_ARGS_PTR,
-            args_len: APP_ARGS_LEN,
-            pid: APP_PID,
-            process_index: APP_PROCESS_INDEX,
-            fds: *core::ptr::addr_of!(APP_FDS),
-            pipes: *core::ptr::addr_of!(APP_PIPES),
-            std_fds: *core::ptr::addr_of!(APP_STD_FDS),
-            cwd: *core::ptr::addr_of!(APP_CWD),
-            cwd_len: APP_CWD_LEN,
-            env: *core::ptr::addr_of!(APP_ENV),
-            last_error: APP_LAST_ERROR,
-            heap_base: APP_HEAP_BASE,
-            heap_next: APP_HEAP_NEXT,
-            heap_limit: APP_HEAP_LIMIT,
-            mmap_next: APP_MMAP_NEXT,
-            mmap_limit: APP_MMAP_LIMIT,
-        }
-    }
-}
-
-fn app_restore(snapshot: AppStateSnapshot) {
-    unsafe {
-        APP_CONSOLE = snapshot.console;
-        APP_BOOTFS = snapshot.bootfs;
-        APP_ARGS_PTR = snapshot.args_ptr;
-        APP_ARGS_LEN = snapshot.args_len;
-        APP_PID = snapshot.pid;
-        APP_PROCESS_INDEX = snapshot.process_index;
-        *core::ptr::addr_of_mut!(APP_FDS) = snapshot.fds;
-        *core::ptr::addr_of_mut!(APP_PIPES) = snapshot.pipes;
-        *core::ptr::addr_of_mut!(APP_STD_FDS) = snapshot.std_fds;
-        *core::ptr::addr_of_mut!(APP_CWD) = snapshot.cwd;
-        APP_CWD_LEN = snapshot.cwd_len;
-        *core::ptr::addr_of_mut!(APP_ENV) = snapshot.env;
-        APP_LAST_ERROR = snapshot.last_error;
-        APP_HEAP_BASE = snapshot.heap_base;
-        APP_HEAP_NEXT = snapshot.heap_next;
-        APP_HEAP_LIMIT = snapshot.heap_limit;
-        APP_MMAP_NEXT = snapshot.mmap_next;
-        APP_MMAP_LIMIT = snapshot.mmap_limit;
-    }
-}
-
-/// A confirmed, real bug lived here, not just a style nit: this used to
-/// snapshot the *entire* live `APP_PIPES` array into a local (`child_pipes`)
-/// before restoring, so the merge below could compare against it. That's an
-/// extra full-size copy of an already-large array (each `AppPipe` embeds a
-/// whole `APP_PIPE_BUFFER_SIZE`-byte buffer) on top of the `snapshot`
-/// parameter's own copy, stacked on the kernel's single call stack at every
-/// level of a nested spawn chain. Confirmed live: a real 3-level nested
-/// `Command` chain (`cargolike` -> `relay` -> `relay` -> `hello`) hung
-/// (not crashed -- this kernel has no stack guard page, so an overflow
-/// silently corrupts adjacent memory instead of faulting) right at this
-/// function's entry for the innermost spawn, the single deepest point of
-/// stack usage in the whole chain. Fixed by merging the live pipe data
-/// directly into `snapshot`'s own already-allocated `pipes` field instead of
-/// a second full-array copy -- same result, no extra large local.
-fn app_restore_after_spawn(mut snapshot: AppStateSnapshot) {
-    unsafe {
-        let pipes = core::ptr::addr_of!(APP_PIPES);
-        for index in 0..APP_PIPE_COUNT {
-            if snapshot.pipes[index].used {
-                snapshot.pipes[index].buffer = (*pipes)[index].buffer;
-                snapshot.pipes[index].read_offset = (*pipes)[index].read_offset;
-                snapshot.pipes[index].len = (*pipes)[index].len;
-            }
-        }
-    }
-    app_restore(snapshot);
-}
-
-fn app_set_heap_window(pid: u32) {
+/// Sets up `PROCESS_TABLE[index]`'s heap/mmap bump-allocator window. Takes
+/// an explicit index (not `CURRENT_PROCESS_INDEX`) since category 2's
+/// scheduler work prepares a new process's window *before* ever switching
+/// to it -- see `prepare_process`. `heap_base`/`heap_limit`/`mmap_limit`
+/// are pure functions of `pid` (a fixed per-pid address slice) and are
+/// simply (re)computed here; `heap_next`/`mmap_next` are only reset to the
+/// base the *first* time a given process's window is set up, so a process
+/// resumed after being switched away (once real concurrency exists) never
+/// has its bump-pointer progress clobbered back to the base.
+fn app_set_heap_window(index: usize, pid: u32) {
     unsafe {
         let base = USER_HEAP_BASE + pid as u64 * USER_HEAP_STRIDE;
         let mmap_base = USER_MMAP_BASE + pid as u64 * USER_MMAP_STRIDE;
-        APP_HEAP_BASE = base;
-        APP_HEAP_NEXT = base;
-        APP_HEAP_LIMIT = base + USER_HEAP_STRIDE;
-        APP_MMAP_NEXT = mmap_base;
-        APP_MMAP_LIMIT = mmap_base + USER_MMAP_SIZE;
-        if APP_PROCESS_INDEX < PROCESS_COUNT {
+        if index <= PROCESS_COUNT {
             let table = &raw mut PROCESS_TABLE;
-            (*table)[APP_PROCESS_INDEX].heap_base = base;
+            let process = &mut (*table)[index];
+            let first_setup = process.heap_base == 0;
+            process.heap_base = base;
+            process.heap_limit = base + USER_HEAP_STRIDE;
+            process.mmap_limit = mmap_base + USER_MMAP_SIZE;
+            if first_setup {
+                process.heap_next = base;
+                process.mmap_next = mmap_base;
+            }
         }
-    }
-}
-
-fn app_clear_heap_window() {
-    unsafe {
-        APP_HEAP_BASE = 0;
-        APP_HEAP_NEXT = 0;
-        APP_HEAP_LIMIT = 0;
-        APP_MMAP_NEXT = 0;
-        APP_MMAP_LIMIT = 0;
     }
 }
 
@@ -5720,6 +6012,18 @@ fn run_script(console: &mut Console, fs: &mut RamFs, bootfs: BootFs, name: &[u8]
     }
 }
 
+/// Runs a top-level console `run <program>` command. Prepares the process
+/// exactly like a nested `spawn` does now (`prepare_process` -- isolated
+/// address space, own kernel stack, initial context) and then blocks on it
+/// the same way `abi_wait` does (`wait_for_pid_blocking`), so the console
+/// stays "synchronous from the shell's perspective" (a `run` command
+/// doesn't return to the prompt until the program exits, matching every
+/// user-visible behavior before this refactor) while the process itself
+/// now runs through the real scheduler rather than a nested function call.
+/// A top-level process has no ABI parent to inherit stdio/cwd/env from, so
+/// it starts fresh (matching pre-refactor behavior) instead of copying the
+/// console's own ambient state the way `spawn_prepared` copies a real
+/// parent's.
 fn run_program(console: &mut Console, bootfs: BootFs, name: &[u8], args: &[u8]) {
     let Some(process_index) = process_spawn(name, args) else {
         console.write_line("run: process table full");
@@ -5734,11 +6038,6 @@ fn run_program(console: &mut Console, bootfs: BootFs, name: &[u8], args: &[u8]) 
         return;
     };
 
-    let Some(entry) = load_program_elf(console, image) else {
-        process_fail_unwaited(process_index);
-        return;
-    };
-
     console.write("run: ");
     console.write_bytes(&path[..path_len]);
     console.write(" pid ");
@@ -5746,59 +6045,47 @@ fn run_program(console: &mut Console, bootfs: BootFs, name: &[u8], args: &[u8]) 
     console.new_line();
 
     unsafe {
-        process_set_state(process_index, ProcessState::Running, 0);
         APP_CONSOLE = console as *mut Console;
         APP_BOOTFS = bootfs;
-        APP_ARGS_PTR = args.as_ptr();
-        APP_ARGS_LEN = args.len();
-        APP_PID = process_pid(process_index);
-        APP_PROCESS_INDEX = process_index;
-        app_set_heap_window(APP_PID);
+        // Shared (not per-process, see `Process`'s docs) fd/pipe table
+        // hygiene between sequential top-level shell commands -- matches
+        // pre-refactor behavior. Safe today since the shell only ever has
+        // one top-level foreground command pending at a time (it blocks
+        // below until this exact process exits before processing anything
+        // else); revisit once Stage 4 adds real backgrounded daemons that
+        // could still be alive when a *different* top-level command starts.
         app_close_all_fds();
-        reset_app_std_fds();
-        app_reset_path_state();
-        let program: extern "sysv64" fn(*const RymosAbi) -> i32 = core::mem::transmute(entry);
-        let code = program(&RYMOS_ABI);
-
-        // Defense in depth, matching `run_ready_task`: a top-level `run`'d
-        // program can spawn children via the ABI too. Nothing should ever
-        // actually be `Ready` here under today's eager spawn (see
-        // `spawn_prepared`'s docs), but if that ever changes, this is where
-        // anything it never waited on would need to run before this process
-        // itself finishes.
-        while let Some(pending) = find_ready_child_of(APP_PID) {
-            run_ready_task(pending);
-        }
-
-        app_close_all_fds();
-        reset_app_std_fds();
-        let reclaimed = process_reclaim_mappings(process_index);
-        reclaim_process_window_tables(APP_PID);
-        app_clear_heap_window();
-        APP_CONSOLE = core::ptr::null_mut();
-        APP_BOOTFS = BootFs::empty();
-        APP_ARGS_PTR = core::ptr::null();
-        APP_ARGS_LEN = 0;
-        APP_PID = 0;
-        APP_PROCESS_INDEX = PROCESS_COUNT;
-        app_reset_path_state();
-        process_set_state(process_index, ProcessState::Exited, code);
-        // Same reasoning as `process_fail_unwaited`: nobody will ever call
-        // `wait`/`wait_any` on a top-level `run`'d process, so it must not
-        // become an unreapable zombie.
-        {
-            let table = &raw mut PROCESS_TABLE;
-            (*table)[process_index].waited = true;
-        }
-        if reclaimed > 0 {
-            console.write("heap reclaimed ");
-            console.write_usize(reclaimed);
-            console.write_line(" pages");
-        }
-        console.write("exit ");
-        console.write_i32(code);
-        console.new_line();
+        let table = &raw mut PROCESS_TABLE;
+        let process = &mut (*table)[process_index];
+        process.std_fds = [STDIN_FD, STDOUT_FD, STDERR_FD];
+        process.cwd.fill(0);
+        process.cwd[0] = b'/';
+        process.cwd_len = 1;
+        process.last_error = ERR_OK;
     }
+
+    if !prepare_process(process_index, console, image) {
+        console.write_line("run: failed to prepare process");
+        return;
+    }
+
+    let pid = process_pid(process_index);
+    let code = match wait_for_pid_blocking(pid) {
+        Some(status) => status.exit_code,
+        None => -1,
+    };
+
+    // Same reasoning as `process_fail_unwaited`: nobody will ever call
+    // `wait`/`wait_any` on a top-level `run`'d process, so it must not
+    // become an unreapable zombie.
+    unsafe {
+        let table = &raw mut PROCESS_TABLE;
+        (*table)[process_index].waited = true;
+    }
+
+    console.write("exit ");
+    console.write_i32(code);
+    console.new_line();
 }
 
 fn program_path<'a>(name: &[u8], output: &'a mut [u8; 32]) -> usize {
@@ -5821,70 +6108,15 @@ fn program_path<'a>(name: &[u8], output: &'a mut [u8; 32]) -> usize {
     len
 }
 
-fn load_program_elf(console: &mut Console, elf: &[u8]) -> Option<u64> {
-    load_program_elf_segments(console, elf)
-}
-
-fn load_program_elf_segments(console: &mut Console, elf: &[u8]) -> Option<u64> {
-    if elf.len() < core::mem::size_of::<Elf64Header>() {
-        console.write_line("run: bad elf header");
-        return None;
-    }
-
-    let header = unsafe { &*(elf.as_ptr().cast::<Elf64Header>()) };
-    if &header.ident[0..4] != ELF_MAGIC || header.ident[4] != 2 || header.machine != 0x3E {
-        console.write_line("run: unsupported elf");
-        return None;
-    }
-
-    let phoff = header.phoff as usize;
-    let phentsize = header.phentsize as usize;
-    let phnum = header.phnum as usize;
-    if phentsize < core::mem::size_of::<Elf64ProgramHeader>()
-        || phoff + phentsize * phnum > elf.len()
-    {
-        console.write_line("run: bad program headers");
-        return None;
-    }
-
-    for index in 0..phnum {
-        let ph = unsafe {
-            &*(elf
-                .as_ptr()
-                .add(phoff + index * phentsize)
-                .cast::<Elf64ProgramHeader>())
-        };
-        if ph.typ != PT_LOAD || ph.memsz == 0 {
-            continue;
-        }
-        if ph.offset as usize + ph.filesz as usize > elf.len() || ph.filesz > ph.memsz {
-            console.write_line("run: bad load segment");
-            return None;
-        }
-        if ph.paddr < APP_LOAD_MIN || ph.paddr + ph.memsz > APP_LOAD_MAX {
-            console.write_line("run: segment outside app area");
-            return None;
-        }
-
-        let destination = ph.paddr as *mut u8;
-        unsafe {
-            zero_bytes(destination, ph.memsz as usize);
-            copy_nonoverlapping(
-                elf.as_ptr().add(ph.offset as usize),
-                destination,
-                ph.filesz as usize,
-            );
-        }
-    }
-
-    Some(header.entry)
-}
-
-/// Like `load_program_elf_segments`, but for a process with its own private
-/// address space (see `create_process_address_space`): instead of assuming
-/// the fixed program-image window is already accessible (identity-mapped),
-/// this maps fresh physical pages for every `PT_LOAD` segment into the given
-/// PML4.
+/// Loads an ELF image's `PT_LOAD` segments for a process with its own
+/// private address space (see `create_process_address_space`): maps fresh
+/// physical pages for every segment into the given PML4 rather than
+/// assuming the fixed program-image window is already accessible. Every
+/// process is isolated this way now (category 2's scheduler work unified
+/// top-level `run` commands and nested `spawn`s onto the same
+/// `prepare_process` path, since real concurrent scheduling needs every
+/// runnable process to have its own address space regardless of how it
+/// was started).
 ///
 /// Deliberately does *not* use `process_track_mapping`/`process_reclaim_mappings`:
 /// those always unmap against the shared `KERNEL_PML4_PHYS` (that's correct
@@ -6673,7 +6905,7 @@ fn report_fault(vector: u8, mnemonic: &str, frame: &InterruptStackFrame, error_c
     fault_print_hex(frame.stack_segment);
     fault_print("\r\n");
     unsafe {
-        let index = APP_PROCESS_INDEX;
+        let index = CURRENT_PROCESS_INDEX;
         if index < PROCESS_COUNT {
             let table = &raw const PROCESS_TABLE;
             let process = &(*table)[index];

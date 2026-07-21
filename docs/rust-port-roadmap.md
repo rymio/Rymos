@@ -144,8 +144,14 @@ For the exact commands to set up a machine and rebuild everything by hand
   never reaches it. Doesn't affect `output()`/`.status()` (what cargo/rustc
   invocation actually uses, since neither feeds stdin data by default) --
   only the less-common pattern of spawning then interactively writing to a
-  child's stdin, which needs real concurrent execution to fix (category 2's
-  still-open scheduler work), not more ABI wiring.
+  child's stdin. Real concurrent execution now exists (category 2's
+  scheduler work, see Current Foundation) -- `spawn_argv` itself genuinely
+  enqueues and returns without running the child -- but `sys::process::rymos`'s
+  `spawn_now` still deliberately bundles an `abi::wait` right after
+  `spawn_argv`, preserving `Command::spawn()`'s old synchronous-completion
+  semantics rather than exposing the new async spawn directly. Exposing a
+  real interactive `Child::stdin` would mean *not* bundling that wait --
+  a deliberate, still-open follow-up, not more ABI wiring.
 
   Verified live in QEMU: `stdreal`'s `Command::output()` captured a real
   child's exit code (`0`) and 326 bytes of its actual stdout; `.status()`
@@ -429,6 +435,54 @@ For the exact commands to set up a machine and rebuild everything by hand
   `APP_ENV`, heap/mmap pointers) moved into a real per-process control block,
   regardless of whether the eventual scheduler is cooperative or preemptive.
 
+  That precondition is now done, in a later session: all per-process ABI
+  state (18 flat `static mut APP_*` globals) moved onto `Process` itself --
+  a real control block, addressed through one `CURRENT_PROCESS_INDEX`
+  global -- eliminating the `AppStateSnapshot`/`app_snapshot`/`app_restore`/
+  `app_restore_after_spawn` save-and-restore-around-spawn machinery
+  entirely (the same machinery a nested-spawn stress test upstream had
+  already found and fixed a real stack-corruption bug in). `APP_CONSOLE`/
+  `APP_BOOTFS` stayed flat (genuinely process-independent -- one physical
+  console/boot image for the whole kernel) and `APP_FDS`/`APP_PIPES` stayed
+  a shared table deliberately (already a de facto shared resource under
+  today's one-task-at-a-time model; real per-process fd/pipe isolation
+  with duplication-on-spawn semantics is a separate, larger lift, not
+  attempted here). Deliberately mechanical and behavior-preserving --
+  spawn is still fully synchronous, no scheduler yet. Verified live in
+  QEMU: the full existing regression suite, including `cargolike`'s
+  nested-spawn test and a 3-level `relay` chain, produced byte-identical
+  output before and after. A scheduler with saved per-process CPU context,
+  per-process kernel stacks, and eventually preemption is still ahead --
+  paused deliberately before starting that part, given its size and risk
+  (hand-written context-switch assembly, and later the first interrupt
+  handler in this kernel that must resume rather than diagnose-and-halt),
+  rather than pushed through in one sitting.
+
+  That scheduler is now done too, in a later session still: `spawn`
+  genuinely enqueues a child and returns immediately rather than running it
+  inline. A hand-written `context_switch` (naked asm, SysV callee-saved
+  registers + `rsp` only -- a fiber-style save, not a full interrupt frame,
+  since it only ever fires at a deliberate call site) plus per-pid kernel
+  stacks (a new address window, same pre-touched-PML4 pattern as
+  heap/mmap, but with a guard gap left unmapped since a stack has no
+  software bump-pointer check the way heap/mmap do) make `wait`/`wait_any`
+  real blocking calls: a caller whose target hasn't exited marks itself
+  `Blocked` and yields into the scheduler, reconsidered only once that pid
+  actually exits. This is the same deferred-spawn idea reverted above, but
+  this time the callers it broke were actually fixed instead of worked
+  around: rysh's `spawnredir`/`spawnstdin`/`spawnio`/`spawnioe` and
+  `rymos-user`'s `run_command_output`/`run_command_status` now `wait()` the
+  child before reverting stdio redirection, not after. Verified live in
+  QEMU by replaying the exact `echoin`-via-rysh hang from the reverted
+  attempt (now completes cleanly with real captured pipe data) plus the
+  full regression suite unchanged. Still cooperative, not preemptive --
+  yields only happen at `wait`/`wait_any` and process exit, so this alone
+  doesn't let two daemons interleave; that needs a timer interrupt actually
+  driving the reschedule decision, still ahead. `sys::process::rymos`'s
+  `spawn_now` deliberately keeps bundling a `wait` right after `spawn_argv`
+  regardless, to preserve `Command::spawn()`'s old synchronous-completion
+  semantics rather than exposing the new async spawn directly to `std`.
+
 - RYMFS4 -> RYMFS5: files are no longer limited to a single contiguous run of
   sectors. Each entry can span up to 4 extents (`start_sector`/`sector_count`
   pairs); `pfs_find_free_run` scans every other entry's extents for gaps and
@@ -564,22 +618,25 @@ For the exact commands to set up a machine and rebuild everything by hand
    - true process reaping -- done: a zombie's process-table slot can no
      longer be silently reused before its real parent collects its exit
      status via `wait`/`wait_any` (see Current Foundation)
-   - real concurrent execution: a scheduler, saved per-process CPU
-     register/stack context, and preemption (today's isolation only means a
-     child can't corrupt its parent's memory, not that they run at once). A
-     deferred/queued cooperative version (no preemption, just: enqueue at
-     spawn, actually run later when something waits) was attempted and
-     reverted -- it broke live in QEMU, because several of rysh's shell
-     built-ins and every `rymos-user` `Command` helper redirect stdio/cwd/env
-     and read the result with no intervening `wait()` call at all, relying
-     entirely on `spawn` finishing synchronously before returning. Real
-     concurrency of any kind still needs the ABI's flat globals (fds, cwd,
-     env, heap/mmap pointers) moved into a real per-process control block
-     first (see Current Foundation).
+   - real concurrent execution: a scheduler and saved per-process CPU
+     register/stack context -- done: see Current Foundation. A first
+     deferred/queued cooperative attempt (enqueue at spawn, actually run
+     later when something waits) was tried and reverted because several of
+     rysh's shell built-ins and every `rymos-user` `Command` helper
+     redirected stdio/cwd/env and read the result with no intervening
+     `wait()` call, relying on `spawn` finishing synchronously. The second
+     attempt, after the ABI's flat globals moved into a real per-process
+     control block, fixed those callers for real instead of reverting again
+     -- `spawn` now genuinely enqueues and returns, a hand-written
+     `context_switch` plus per-pid kernel stacks make `wait`/`wait_any`
+     real blocking calls, and the previously-broken callers now `wait()`
+     before reverting redirection. Still cooperative, not preemptive: no
+     timer interrupt exists yet, so this doesn't yet let two daemons
+     interleave -- that's still ahead.
    - real `exec` (replace the current process image in place)
-   - wait that blocks on running children (moot until real concurrent
-     execution exists -- nothing is ever pending under today's synchronous
-     spawn)
+   - wait that blocks on running children -- done: see Current Foundation
+     (`wait`/`wait_any` really block on a still-running child now, instead
+     of being pure table lookups)
 
 3. Runtime surface:
    - broaden argv support beyond the current 8 args / 64 bytes per arg (this

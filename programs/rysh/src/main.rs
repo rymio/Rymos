@@ -386,6 +386,16 @@ fn spawn_redir(rest: &[u8]) {
         return;
     }
     let spawn_result = rt::spawn(program, args);
+    // `spawn` only enqueues the child now (category 2's scheduler work) --
+    // it may not have actually run yet. Must `wait` for it *before*
+    // reverting this redirection or reading the pipe below, since reverting
+    // first would mean the child (once it does run) writes to whatever
+    // STDOUT was reverted to, not this pipe -- exactly the bug a genuinely
+    // deferred spawn model was reverted over earlier this session, now
+    // fixed for real since `wait` actually drives the scheduler.
+    if let Ok(pid) = spawn_result {
+        let _ = rt::wait(pid);
+    }
     let _ = rt::dup2(rt::STDOUT, rt::STDOUT);
     match spawn_result {
         Ok(pid) => {
@@ -442,7 +452,14 @@ fn spawn_stdin(rest: &[u8]) {
         let _ = rt::close_fd(write_fd);
         return;
     }
-    match rt::spawn(program, b"") {
+    let spawn_result = rt::spawn(program, b"");
+    // See `spawn_redir`'s matching comment: must wait before reverting the
+    // redirection, since spawn only enqueues the child now.
+    if let Ok(pid) = spawn_result {
+        let _ = rt::wait(pid);
+    }
+    let _ = rt::dup2(rt::STDIN, rt::STDIN);
+    match spawn_result {
         Ok(pid) => {
             rt::print("spawnstdin pid ");
             rt::print_usize(pid as usize);
@@ -454,7 +471,6 @@ fn spawn_stdin(rest: &[u8]) {
             rt::write(b"\n");
         }
     }
-    let _ = rt::dup2(rt::STDIN, rt::STDIN);
     let _ = rt::close_fd(read_fd);
     let _ = rt::close_fd(write_fd);
 }
@@ -499,6 +515,11 @@ fn spawn_io(rest: &[u8]) {
         return;
     }
     let spawn_result = rt::spawn(program, b"");
+    // See `spawn_redir`'s matching comment: must wait before reverting the
+    // redirection, since spawn only enqueues the child now.
+    if let Ok(pid) = spawn_result {
+        let _ = rt::wait(pid);
+    }
     let _ = rt::dup2(rt::STDIN, rt::STDIN);
     let _ = rt::dup2(rt::STDOUT, rt::STDOUT);
     match spawn_result {
@@ -581,6 +602,11 @@ fn spawn_io_err(rest: &[u8]) {
     }
 
     let spawn_result = rt::spawn(program, b"");
+    // See `spawn_redir`'s matching comment: must wait before reverting the
+    // redirection, since spawn only enqueues the child now.
+    if let Ok(pid) = spawn_result {
+        let _ = rt::wait(pid);
+    }
     reset_stdio();
     match spawn_result {
         Ok(pid) => {

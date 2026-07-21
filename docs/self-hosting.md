@@ -103,6 +103,110 @@ See `docs/rust-port-roadmap.md` for the detailed cargo/rustc port sequence.
 
 ## Recently Closed
 
+- **Real per-process control block (category 2, stage 1 of the scheduler
+  work)**: the reverted deferred-spawn attempt's postmortem (below) named
+  the actual blocker for real concurrent execution: 18 flat `static mut
+  APP_*` globals (console, bootfs, args, pid, process index, fds, pipes,
+  std fds, cwd, env, last error, heap/mmap bump pointers) holding all
+  per-process ABI state, swapped in and out around each synchronous spawn
+  boundary via `AppStateSnapshot`/`app_snapshot`/`app_restore`/
+  `app_restore_after_spawn` -- the same machinery that had a confirmed,
+  fixed stack-corruption bug earlier this session under deep nested spawns.
+  That snapshot dance is gone now: per-process state lives directly on
+  `Process` itself (a real control block), addressed through one
+  `CURRENT_PROCESS_INDEX` global. A context switch is now just "change
+  which index is current," not a copy of a large struct -- the actual
+  precondition the plan called for before any scheduler (cooperative or
+  preemptive) could be safe. `PROCESS_TABLE` grew one extra reserved slot
+  (`PROCESS_COUNT + 1`) as a permanent "idle/no process" index, so every
+  existing `index >= PROCESS_COUNT` sentinel check throughout the file
+  stayed correct unchanged -- real spawns still only ever allocate
+  `0..PROCESS_COUNT`. `APP_CONSOLE`/`APP_BOOTFS`/`APP_FDS`/`APP_PIPES`
+  deliberately stayed flat globals rather than per-process fields: the
+  first two are genuinely process-independent (one physical console/boot
+  image for the whole kernel), and the latter two are already a de facto
+  shared table today (only one process ever runs at a time) -- moving them
+  is a separate, larger lift (real per-process fd/pipe tables with
+  duplication-on-spawn semantics, not attempted here) tracked as a known,
+  disclosed scope boundary rather than silently limited.
+
+  Deliberately mechanical and behavior-preserving -- no scheduler yet,
+  spawn is still fully synchronous. Verified live in QEMU against the full
+  existing regression suite (hello, rysh, `cmdapi`'s full check suite,
+  `fswalk`, `heapstress`, `stdshim`, `cargolike` including its nested-spawn
+  test, and a 3-level `relay` chain) with byte-identical output to before
+  the refactor -- confirming the migration changed *where* state lives,
+  not what the ABI does. Real concurrent execution (a scheduler with saved
+  per-process CPU context, per-process kernel stacks, and eventually
+  preemption) is the next, still-separate stage -- paused here deliberately
+  rather than pushed through in one sitting, given the size and risk of
+  what's left (hand-written context-switch assembly and, later, the first
+  interrupt handler in this kernel that must resume rather than
+  diagnose-and-halt).
+
+- **Per-process kernel stacks + a real cooperative scheduler (category 2,
+  stage 2 of the scheduler work)**: `spawn` no longer runs a child
+  synchronously to completion as a nested Rust call on the kernel's one
+  shared stack -- it now prepares the child's address space and its own
+  per-pid kernel stack, marks it `Ready`, and returns immediately. Real
+  execution happens via a hand-written `context_switch` (naked asm, SysV
+  callee-saved regs + `rsp` only -- a fiber/ucontext-style save, not a full
+  interrupt frame, since it only ever fires at a deliberate call site) plus
+  a `switch_to` wrapper that also swaps `CR3`. `wait`/`abi_wait_any` are
+  real blocking calls now: a caller whose target hasn't exited marks itself
+  `Blocked` (a new `ProcessState` variant) with a `WaitTarget` and yields
+  into the scheduler, which only reconsiders it once that pid actually
+  exits (`wake_waiters_for`). A new per-pid kernel-stack address window
+  (`KERNEL_STACK_BASE`, 2 MiB stride) reuses the heap/mmap pre-touched-PML4
+  pattern, but only maps the top 32 pages of each stride -- a deliberate
+  guard gap, since a stack (unlike heap/mmap's software bump-pointer
+  checks) has no bound check of its own and this kernel has no hardware
+  guard pages; without the gap, overflow would silently corrupt the next
+  pid's stack instead of cleanly faulting.
+
+  Two real bugs surfaced and were fixed before this was safe: a process
+  cannot free the very stack it's currently executing on (`process_trampoline`
+  unmapping its own stack hung the kernel right after its last print) --
+  fixed with a deferred-reclaim queue drained by the *next* successful
+  `context_switch` return, which by construction is always running on a
+  different stack. And destroying a process's address space frees the
+  physical page its own `CR3` still points at -- fixed by explicitly
+  restoring `CR3` to the shared kernel PML4 immediately after teardown,
+  closing a window where the CPU briefly ran on a dangling page-table root.
+
+  This is also the second, successful attempt at deferred/async spawn --
+  the first was reverted (see below) because several real callers spawned,
+  immediately reverted stdio redirection or read a pipe, and assumed the
+  old synchronous-completion behavior with no `wait()` in between. This
+  time the callers were actually fixed instead of worked around: rysh's
+  `spawn_redir`/`spawn_stdin`/`spawn_io`/`spawn_io_err` builtins and
+  `rymos-user`'s `run_command_output`/`run_command_status` now `wait()` the
+  child before reverting redirection, not after. Verified live in QEMU by
+  replaying the exact scenario that hung the reverted attempt --
+  `echoin` via rysh's `spawnstdin`/`spawnio`/`spawnioe` -- now completing
+  cleanly with real captured pipe data instead of `echoin: stdin read
+  failed`, plus the full regression suite (`cmdapi`'s complete check suite
+  including `spawn-many + wait_any` reaping three concurrent children and
+  zombie-status reaping, `fswalk`, `heapstress`, `stdshim`, `cargolike`
+  including its nested-spawn test, and a 3-level `relay` chain) all passing
+  unchanged. Top-level `run` and nested `spawn` now share one code path
+  (`prepare_process`) -- previously only nested spawns got isolated address
+  spaces, an asymmetry no longer safe to leave once spawns can genuinely
+  overlap.
+
+  Still cooperative, not preemptive: yields only happen at the two explicit
+  call sites above (`wait`/`wait_any`, process exit) -- no timer interrupt
+  exists yet, so two daemons still can't interleave mid-execution. The
+  scheduler core (`pick_next_ready`, `wake_waiters_for`, state transitions)
+  is written with IF-save/restore critical sections from the start even
+  though nothing unmasks interrupts yet, so Stage 3's timer ISR can call
+  into the same core without a rewrite. An audit of every
+  `PHYS_ALLOCATOR`/`PROCESS_TABLE`/`NEXT_PID`/PFS-header touch point found
+  none coinciding with either yield point, so no further critical sections
+  were needed for this stage. Real preemption (a timer interrupt actually
+  driving the reschedule decision, so two backgrounded programs can produce
+  genuinely interleaved output) is the next, still-separate stage.
+
 - **`relay`: a nested-spawn stress test that found and fixed three real,
   layered gaps `cargolike`'s flat, sequential tests couldn't see**:
   `cargolike`'s `repeated_spawn_test` only proved *sequential* spawns (one
@@ -760,19 +864,19 @@ The remaining blockers are now narrower and more concrete:
      longer be silently reused before its real parent collects its exit
      status; see Recently Closed
    - add real concurrent execution: a scheduler, saved per-process CPU
-     register/stack context, and preemption (today's isolation only means a
-     child can't corrupt its parent's memory, not that they run at once).
-     A deferred/queued (cooperative, non-preemptive) version of this was
-     attempted and reverted -- see Recently Closed for the real conflict it
-     found with rysh's shell built-ins and the `Command` helpers. Still
-     needs the ABI's flat globals moved into a real per-process control
-     block before any form of this (cooperative or preemptive) is safe.
+     register/stack context -- done: see Recently Closed. `spawn` genuinely
+     enqueues and returns; a hand-written `context_switch` plus per-pid
+     kernel stacks (with a guard gap) make `wait`/`wait_any` real blocking
+     calls. Still cooperative, not preemptive -- yields only happen at
+     `wait`/`wait_any` and process exit, so two daemons still can't
+     interleave mid-execution. That needs a timer interrupt actually
+     driving the reschedule decision, still ahead.
    - add relocatable/PIE program loading (unrelated to the isolation work
      above, which keeps every process at the same virtual address)
    - add real `exec`
-   - support blocking wait once concurrency exists (moot under today's
-     synchronous spawn -- nothing is ever pending when `wait` is called; only
-     meaningful once real concurrent execution exists)
+   - support blocking wait once concurrency exists -- done: see Recently
+     Closed (`wait`/`wait_any` now really block on a still-running child
+     instead of being pure table lookups)
 
 3. Memory:
    - reclaim page-table pages for the shared heap/mmap windows -- done: see
