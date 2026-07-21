@@ -16,9 +16,15 @@ const TEXT_ROWS_MAX: usize = 48;
 const COM1: u16 = 0x3F8;
 const KEYBOARD_DATA: u16 = 0x60;
 const KEYBOARD_STATUS: u16 = 0x64;
+const PIT_CHANNEL0_DATA: u16 = 0x40;
 const PIT_CHANNEL2_DATA: u16 = 0x42;
 const PIT_COMMAND: u16 = 0x43;
 const PIT_INPUT_HZ: u64 = 1_193_182;
+const PIC1_COMMAND: u16 = 0x20;
+const PIC1_DATA: u16 = 0x21;
+const PIC2_COMMAND: u16 = 0xA0;
+const PIC2_DATA: u16 = 0xA1;
+const PIC_EOI: u8 = 0x20;
 const NMI_STATUS_CONTROL: u16 = 0x61;
 const CMOS_INDEX: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
@@ -722,6 +728,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         BOOT_TSC = read_tsc();
         BOOT_UNIX_NANOS = unix_seconds.saturating_mul(1_000_000_000);
     }
+
+    enable_timer_interrupts();
 
     console.clear();
     console.write_line("RYMOS minimal Rust kernel");
@@ -2361,6 +2369,12 @@ fn memory_summary(console: &mut Console) {
         console.write("  reusable free stack: ");
         console.write_usize(allocator.free_count);
         console.write_line(" pages");
+    }
+
+    unsafe {
+        console.write("  timer ticks (IRQ0, ~100 Hz): ");
+        console.write_usize(TIMER_TICKS as usize);
+        console.new_line();
     }
 }
 
@@ -6746,7 +6760,7 @@ unsafe fn keyboard_has_data() -> bool {
 // in 64-bit ring 0, its active `cs` selector is exactly the one IDT gate
 // descriptors need -- read at init time instead of assuming a fixed value.
 
-const IDT_LEN: usize = 32;
+const IDT_LEN: usize = 48;
 const IDT_GATE_PRESENT_INTERRUPT: u8 = 0x8E;
 
 #[repr(C, packed)]
@@ -7000,6 +7014,174 @@ isr_stub_noerr!(isr_stub_19, 19);
 isr_stub_noerr!(isr_stub_20, 20);
 isr_stub_err!(isr_stub_21, 21);
 
+// --- Timer interrupt (IRQ0) -------------------------------------------------
+//
+// Stage 3a: plumbing only, no rescheduling yet -- deliberately its own
+// checkpoint before the scheduler core gets wired to a tick, since this is
+// the highest-risk code in the whole scheduler/preemption plan: the first
+// interrupt in this kernel that must *resume* the interrupted task, not
+// diagnose-and-halt like every isr_stub_* above.
+//
+// The 8259 PIC's power-on vector base (0x08) collides with CPU exception
+// vectors 8-15 (8 = double fault), so it must be remapped before ever
+// unmasking an IRQ -- `remap_pic` moves IRQ0-7 to vectors 32-39 and IRQ8-15
+// to 40-47. Only IRQ0 (the PIT) is left unmasked; every other line stays
+// masked until something actually needs it. The benign spurious-IRQ stubs
+// below exist purely as defense in depth -- a well-known hardware quirk can
+// still occasionally raise IRQ7/IRQ15 even while masked -- distinct from the
+// fatal exception path so a spurious hit EOIs and resumes instead of halting
+// the whole kernel over nothing.
+//
+// `irq0_stub` saves every general-purpose register (an interrupt can land
+// mid-instruction with any of them live, unlike a normal call site where the
+// compiler has already spilled what it needs), calls into Rust to bump the
+// tick counter and send the End-Of-Interrupt, restores every register, and
+// `iretq`s. The incoming stack alignment at an arbitrary interrupted
+// instruction can't be assumed 16-byte aligned, so it snapshots `rsp` into
+// `rbp` (free to reuse -- `rbp`'s real value is already saved on the stack
+// by that point), aligns down for the SysV `call`, then restores the exact
+// original `rsp` before popping everything back and `iretq`ing -- correct
+// regardless of what the interrupted code's stack looked like.
+//
+// Only `sti` once all of this -- the IDT gates, the PIC remap, and the PIT
+// programming -- is in place (`enable_timer_interrupts`, called once from
+// `_start`). This is the first and only `sti` anywhere in this kernel.
+
+static mut TIMER_TICKS: u64 = 0;
+
+unsafe fn io_wait() {
+    unsafe {
+        outb(0x80, 0);
+    }
+}
+
+fn remap_pic() {
+    unsafe {
+        outb(PIC1_COMMAND, 0x11); // ICW1: begin init, ICW4 present
+        io_wait();
+        outb(PIC2_COMMAND, 0x11);
+        io_wait();
+        outb(PIC1_DATA, 0x20); // ICW2: master offset -> vector 32
+        io_wait();
+        outb(PIC2_DATA, 0x28); // ICW2: slave offset -> vector 40
+        io_wait();
+        outb(PIC1_DATA, 0x04); // ICW3: slave attached at master's IRQ2
+        io_wait();
+        outb(PIC2_DATA, 0x02); // ICW3: slave's own cascade identity
+        io_wait();
+        outb(PIC1_DATA, 0x01); // ICW4: 8086 mode
+        io_wait();
+        outb(PIC2_DATA, 0x01);
+        io_wait();
+        outb(PIC1_DATA, 0xFE); // mask every master line except IRQ0
+        outb(PIC2_DATA, 0xFF); // mask every slave line
+    }
+}
+
+fn init_pit_timer(hz: u32) {
+    let divisor = (PIT_INPUT_HZ / hz as u64) as u16;
+    unsafe {
+        outb(PIT_COMMAND, 0x36); // channel 0, lobyte/hibyte, mode 3, binary
+        outb(PIT_CHANNEL0_DATA, (divisor & 0xFF) as u8);
+        outb(PIT_CHANNEL0_DATA, (divisor >> 8) as u8);
+    }
+}
+
+fn enable_timer_interrupts() {
+    remap_pic();
+    init_pit_timer(100);
+    unsafe {
+        asm!("sti", options(nomem, nostack, preserves_flags));
+    }
+}
+
+extern "sysv64" fn timer_tick_isr() {
+    unsafe {
+        TIMER_TICKS += 1;
+        outb(PIC1_COMMAND, PIC_EOI);
+    }
+}
+
+#[unsafe(naked)]
+extern "sysv64" fn irq0_stub() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "call {handler}",
+        "mov rsp, rbp",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        "iretq",
+        handler = sym timer_tick_isr,
+    )
+}
+
+/// Benign default for the now-technically-reachable master-PIC vectors
+/// (33-39, IRQ1-7) -- masked and not expected to fire, but a spurious IRQ7 is
+/// a well-known hardware quirk that can occur even while masked. Pure inline
+/// asm (no Rust call) since it never needs to inspect anything, just EOI and
+/// resume.
+#[unsafe(naked)]
+extern "sysv64" fn irq_spurious_master_stub() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rdx",
+        "mov al, 0x20",
+        "mov dx, 0x20",
+        "out dx, al",
+        "pop rdx",
+        "pop rax",
+        "iretq",
+    )
+}
+
+/// Same as above for the slave-PIC vectors (40-47, IRQ8-15) -- a spurious
+/// slave IRQ (classically IRQ15) needs EOI sent to both PICs, not just the
+/// slave, or the master's in-service bit for the cascade line never clears.
+#[unsafe(naked)]
+extern "sysv64" fn irq_spurious_slave_stub() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rdx",
+        "mov al, 0x20",
+        "mov dx, 0xA0",
+        "out dx, al",
+        "mov dx, 0x20",
+        "out dx, al",
+        "pop rdx",
+        "pop rax",
+        "iretq",
+    )
+}
+
 fn set_idt_gate(vector: usize, handler: u64, selector: u16) {
     unsafe {
         let idt = &raw mut IDT;
@@ -7049,6 +7231,14 @@ fn init_idt() {
     set_idt_gate(19, isr_stub_19 as *const () as u64, cs);
     set_idt_gate(20, isr_stub_20 as *const () as u64, cs);
     set_idt_gate(21, isr_stub_21 as *const () as u64, cs);
+
+    set_idt_gate(32, irq0_stub as *const () as u64, cs);
+    for vector in 33..=39usize {
+        set_idt_gate(vector, irq_spurious_master_stub as *const () as u64, cs);
+    }
+    for vector in 40..=47usize {
+        set_idt_gate(vector, irq_spurious_slave_stub as *const () as u64, cs);
+    }
 
     unsafe {
         let idt = &raw const IDT;

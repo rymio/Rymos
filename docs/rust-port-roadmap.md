@@ -483,6 +483,25 @@ For the exact commands to set up a machine and rebuild everything by hand
   regardless, to preserve `Command::spawn()`'s old synchronous-completion
   semantics rather than exposing the new async spawn directly to `std`.
 
+  Timer interrupt plumbing (still no rescheduling) landed next, in its own
+  checkpoint given it's the riskiest code in the whole plan -- the first
+  interrupt here that must resume rather than diagnose-and-halt. The 8259
+  PIC is remapped (IRQ0-7 -> vectors 32-39, IRQ8-15 -> 40-47, avoiding the
+  power-on collision with exception vectors 8-15) with only IRQ0 unmasked;
+  PIT channel 0 is programmed for a ~100 Hz tick; `IDT_LEN` grew 32 -> 48.
+  `irq0_stub` saves every general-purpose register, bumps a tick counter
+  and sends EOI via a small Rust call, restores everything, and `iretq`s
+  back unchanged -- since an interrupt can land mid-instruction with any
+  register live and the incoming stack can't be assumed 16-byte aligned,
+  it snapshots `rsp`, aligns down just for the `call`, then restores the
+  exact original `rsp` before resuming. Two benign spurious-IRQ stubs cover
+  vectors 33-47 as defense in depth. `sti` is called exactly once, after
+  all of the above is in place -- the only `sti` in this kernel. Verified
+  live in QEMU: a real, monotonically increasing tick count across one
+  boot (1 -> 1 -> 389) with the full regression suite, including the
+  scheduler work above, passing completely unchanged. Real preemption
+  (the tick actually driving a reschedule decision) is still ahead.
+
 - RYMFS4 -> RYMFS5: files are no longer limited to a single contiguous run of
   sectors. Each entry can span up to 4 extents (`start_sector`/`sector_count`
   pairs); `pfs_find_free_run` scans every other entry's extents for gaps and
@@ -630,9 +649,15 @@ For the exact commands to set up a machine and rebuild everything by hand
      -- `spawn` now genuinely enqueues and returns, a hand-written
      `context_switch` plus per-pid kernel stacks make `wait`/`wait_any`
      real blocking calls, and the previously-broken callers now `wait()`
-     before reverting redirection. Still cooperative, not preemptive: no
-     timer interrupt exists yet, so this doesn't yet let two daemons
-     interleave -- that's still ahead.
+     before reverting redirection. Still cooperative, not preemptive at that
+     point: no timer interrupt existed yet. Timer interrupt plumbing is now
+     done too -- see Current Foundation: the 8259 remapped, PIT programmed
+     for a ~100 Hz tick, IDT grown to cover the new vectors, and a resuming
+     `irq0_stub` (the first interrupt in this kernel that `iretq`s back
+     instead of halting) proven live with a real, increasing tick count and
+     zero regression. Still no actual rescheduling on that tick -- the timer
+     ISR doesn't call into the scheduler core yet, so two daemons still
+     can't interleave. That's the next, still-separate piece (Stage 3b).
    - real `exec` (replace the current process image in place)
    - wait that blocks on running children -- done: see Current Foundation
      (`wait`/`wait_any` really block on a still-running child now, instead

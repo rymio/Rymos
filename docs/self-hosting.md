@@ -207,6 +207,51 @@ See `docs/rust-port-roadmap.md` for the detailed cargo/rustc port sequence.
   driving the reschedule decision, so two backgrounded programs can produce
   genuinely interleaved output) is the next, still-separate stage.
 
+- **Timer interrupt plumbing, no rescheduling yet (category 2, stage 3a of
+  the scheduler work)**: split out as its own checkpoint deliberately, since
+  this is the highest-risk code in the whole scheduler/preemption plan --
+  the first interrupt in this kernel that must *resume* the interrupted
+  task, not diagnose-and-halt like every existing CPU exception handler.
+  The 8259 PIC's power-on vector base (`0x08`) collides with CPU exception
+  vectors 8-15 (8 = double fault), so `remap_pic` moves IRQ0-7 to vectors
+  32-39 and IRQ8-15 to 40-47 before anything gets unmasked; only IRQ0 (the
+  PIT) is left unmasked, every other line stays masked since nothing needs
+  it yet. `IDT_LEN` grew from 32 to 48 to cover the newly-reachable vectors.
+  PIT channel 0 is programmed (mode 3, ~100 Hz) for the periodic tick.
+
+  `irq0_stub` is the new resuming code: it saves every general-purpose
+  register (an interrupt can land mid-instruction with any of them live,
+  unlike a normal call site where the compiler has already spilled what it
+  needs), calls into Rust to bump a tick counter and send the End-Of-
+  Interrupt, restores every register, and `iretq`s back into the
+  interrupted task unchanged. Since the incoming stack alignment at an
+  arbitrary interrupted instruction can't be assumed 16-byte aligned (unlike
+  the existing exception stubs, which can just `and rsp, -16` destructively
+  since they only ever diverge to a fatal halt), it snapshots `rsp` into
+  `rbp` -- free to reuse once `rbp`'s real value is already saved on the
+  stack -- aligns down for the SysV `call`, then restores the exact
+  original `rsp` before popping everything back, correct regardless of what
+  the interrupted code's stack looked like. Two benign default handlers
+  (`irq_spurious_master_stub`/`irq_spurious_slave_stub`, pure inline asm, no
+  Rust call) cover vectors 33-47 as defense in depth -- a spurious IRQ7/
+  IRQ15 is a well-known hardware quirk that can fire even while masked, and
+  this EOIs and resumes instead of hitting the fatal exception path. `sti`
+  is called exactly once, in a new `enable_timer_interrupts`, only after the
+  PIC remap, PIT programming, and all the IDT gates above are already in
+  place -- the first and only `sti` anywhere in this kernel.
+
+  Zero rescheduling logic is touched by this stage on purpose, so a failure
+  would be unambiguous about which half broke (interrupt resume vs.
+  scheduling decision). Verified live in QEMU: a new `timer ticks (IRQ0,
+  ~100 Hz)` line on the existing `mem` command (which the boot script
+  already runs three times) showed a real, monotonically increasing count
+  (1 -> 1 -> 389 across one boot) with the full existing regression suite
+  -- including Stage 2's `echoin`/rysh scenario, `cmdapi`'s spawn-many/
+  wait_any and zombie-reaping checks, `cargolike`, and `relay` -- passing
+  completely unchanged. Real preemption (the timer ISR actually calling
+  into Stage 2's reschedule core, so two backgrounded programs can produce
+  genuinely interleaved output) is Stage 3b, still ahead.
+
 - **`relay`: a nested-spawn stress test that found and fixed three real,
   layered gaps `cargolike`'s flat, sequential tests couldn't see**:
   `cargolike`'s `repeated_spawn_test` only proved *sequential* spawns (one
